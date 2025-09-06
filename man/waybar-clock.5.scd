@@ -262,6 +262,33 @@ In this example:
 - The current timezone is included in the tooltip because *timezone-tooltip-format*
   contains %Z but *format* doesn't
 
+5. Using format-alt with timezone tooltip
+
+```
+"clock": {
+	"interval": 60,
+	"format": "{:%H:%M}",
+	"format-alt": "{:%a %d %b %H:%M}",
+	"format-alt-click": "click-right",
+	"timezone-tooltip-format": "{:%H:%M %Z}",
+	"timezones": [
+		"",
+		"America/New_York",
+		"Europe/London",
+		"Asia/Tokyo"
+	],
+	"tooltip": true,
+	"tooltip-format": "<b>World Clock:</b>\n{tz_list}"
+}
+```
+
+In this example:
+- Main format shows just time (14:30)
+- Right-click switches to format-alt showing weekday and date (Mon 15 Jan 14:30)
+- Neither format shows timezone, keeping the toolbar clean
+- Tooltip always shows all timezones with abbreviations
+- Current timezone appears in tooltip only when the active format doesn't contain %Z
+
 # STYLE
 
 - *#clock*

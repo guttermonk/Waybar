@@ -190,18 +190,21 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
 
   std::stringstream os;
   bool first = true;
-
+  
   // Determine if we should include the current timezone in the tooltip
-  // Include it if timezone-tooltip-format is set and contains timezone info (%Z or %z)
-  // but the main format doesn't contain timezone info
-  bool includeCurrentTz = false;
-  if (!tzTooltipFormat_.empty()) {
-    bool tooltipHasTz = (tzTooltipFormat_.find("%Z") != std::string::npos ||
-                         tzTooltipFormat_.find("%z") != std::string::npos);
-    bool mainHasTz = (format_.find("%Z") != std::string::npos ||
-                      format_.find("%z") != std::string::npos);
-    includeCurrentTz = tooltipHasTz && !mainHasTz;
-  }
+  // The tooltip format to use (either custom or fallback to main format)
+  const std::string& tooltipFormat = tzTooltipFormat_.empty() ? format_ : tzTooltipFormat_;
+  
+  // Check if formats contain timezone info
+  bool tooltipHasTz = (tooltipFormat.find("%Z") != std::string::npos || 
+                       tooltipFormat.find("%z") != std::string::npos);
+  bool mainHasTz = (format_.find("%Z") != std::string::npos || 
+                    format_.find("%z") != std::string::npos);
+  
+  // Include current timezone only if:
+  // 1. Tooltip format has timezone info AND main format doesn't (avoid redundancy)
+  // 2. OR if a custom tooltip format is specified with TZ while main doesn't have TZ
+  bool includeCurrentTz = tooltipHasTz && !mainHasTz;
 
   for (size_t tz_idx{0}; tz_idx < tzList_.size(); ++tz_idx) {
     // Skip current timezone unless we determined we should include it
@@ -216,9 +219,8 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
     }
     first = false;
 
-    // Use timezone-tooltip-format if specified, otherwise use format_
-    const std::string& fmt = tzTooltipFormat_.empty() ? format_ : tzTooltipFormat_;
-    os << fmt_lib::vformat(m_locale_, fmt, fmt_lib::make_format_args(zt));
+    // Use the same format determined earlier
+    os << fmt_lib::vformat(m_locale_, tooltipFormat, fmt_lib::make_format_args(zt));
   }
 
   return os.str();
