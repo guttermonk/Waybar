@@ -162,8 +162,11 @@ auto waybar::modules::Clock::update() -> void {
         tz, local_days(shiftedDay) + (now.get_local_time() - floor<days>(now.get_local_time()))};
 
     if (tzInTooltip_) {
-      spdlog::debug("Clock::update - Generating timezone tooltip, current format_='{}'", format_);
+      spdlog::debug("Clock::update - Generating timezone tooltip, current format_='{}', alt_={}", 
+                    format_, alt_);
       tzText_ = getTZtext(now.get_sys_time());
+      spdlog::debug("Clock::update - Generated timezone text (length={}): '{}'", 
+                    tzText_.length(), tzText_);
     }
     if (cldInTooltip_) cldText_ = get_calendar(today, shiftedDay, tz);
     if (ordInTooltip_) ordText_ = get_ordinal_date(shiftedDay);
@@ -251,12 +254,37 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
                 format_, tzTooltipFormat_, tooltipFormat);
   spdlog::debug("Clock::getTZtext - currentFormatHasTz={}, includeCurrentTz={}, tzCurrIdx={}", 
                 currentFormatHasTz, includeCurrentTz, tzCurrIdx_);
+  
+  // Additional detailed debugging
+  if (!tzTooltipFormat_.empty()) {
+    bool tooltipHasTz = hasTimezoneInFormat(tzTooltipFormat_);
+    spdlog::debug("Clock::getTZtext - tzTooltipFormat_ is set, tooltipHasTz={}", tooltipHasTz);
+    spdlog::debug("Clock::getTZtext - Decision: includeCurrentTz={} (tooltipHasTz={} && !currentFormatHasTz={})", 
+                  includeCurrentTz, tooltipHasTz, !currentFormatHasTz);
+  } else {
+    spdlog::debug("Clock::getTZtext - tzTooltipFormat_ is empty, using default behavior");
+  }
+  
+  if (tzList_.size() > 0 && tzCurrIdx_ < static_cast<int>(tzList_.size())) {
+    const auto* currentTz = tzList_[tzCurrIdx_];
+    spdlog::debug("Clock::getTZtext - Current timezone index={}, zone={}", 
+                  tzCurrIdx_, currentTz ? currentTz->name() : "local");
+  }
 
   for (size_t tz_idx{0}; tz_idx < tzList_.size(); ++tz_idx) {
     // Skip current timezone unless we explicitly want to include it
-    if (static_cast<int>(tz_idx) == tzCurrIdx_ && !includeCurrentTz) continue;
+    bool isCurrentTz = (static_cast<int>(tz_idx) == tzCurrIdx_);
+    
+    if (isCurrentTz && !includeCurrentTz) {
+      const auto* tz = tzList_[tz_idx] != nullptr ? tzList_[tz_idx] : local_zone();
+      spdlog::debug("Clock::getTZtext - Skipping timezone[{}]='{}' (current timezone)", 
+                    tz_idx, tz->name());
+      continue;
+    }
 
     const auto* tz = tzList_[tz_idx] != nullptr ? tzList_[tz_idx] : local_zone();
+    spdlog::debug("Clock::getTZtext - Including timezone[{}]='{}' (isCurrentTz={})", 
+                  tz_idx, tz->name(), isCurrentTz);
     auto zt{zoned_time{tz, now}};
 
     // Add newline before each entry except the first
