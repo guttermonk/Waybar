@@ -42,9 +42,11 @@ $XDG_CONFIG_HOME/waybar/config ++
 |[ *timezone-tooltip-format*
 :[ string
 :[
-:[ Format to use for displaying timezones in the tooltip. When set, this allows showing
-   timezone information (like timezone abbreviations) in the tooltip while keeping the
-   main display clean. Uses the same format options as *format*
+:[ Format to use for displaying timezones in the tooltip. When set with timezone
+   format codes (%Z or %z) while the main *format* doesn't contain them, the current
+   timezone will also be included in the tooltip list. This allows showing timezone
+   information in the tooltip while keeping the main display clean. Uses the same
+   format options as *format*
 |[ *locale*
 :[ string
 :[
@@ -253,6 +255,12 @@ View all valid format options in *strftime(3)* or have a look https://en.cpprefe
 	"tooltip-format": "{tz_list}"
 }
 ```
+
+In this example:
+- The toolbar shows clean time without timezone (14:30)
+- The tooltip shows all timezones including the current one with abbreviations
+- The current timezone is included in the tooltip because *timezone-tooltip-format*
+  contains %Z but *format* doesn't
 
 # STYLE
 

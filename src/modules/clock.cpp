@@ -190,19 +190,32 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
 
   std::stringstream os;
   bool first = true;
+
+  // Determine if we should include the current timezone in the tooltip
+  // Include it if timezone-tooltip-format is set and contains timezone info (%Z or %z)
+  // but the main format doesn't contain timezone info
+  bool includeCurrentTz = false;
+  if (!tzTooltipFormat_.empty()) {
+    bool tooltipHasTz = (tzTooltipFormat_.find("%Z") != std::string::npos ||
+                         tzTooltipFormat_.find("%z") != std::string::npos);
+    bool mainHasTz = (format_.find("%Z") != std::string::npos ||
+                      format_.find("%z") != std::string::npos);
+    includeCurrentTz = tooltipHasTz && !mainHasTz;
+  }
+
   for (size_t tz_idx{0}; tz_idx < tzList_.size(); ++tz_idx) {
-    // Skip current timezone unless timezone-tooltip-format is specified
-    if (static_cast<int>(tz_idx) == tzCurrIdx_ && tzTooltipFormat_.empty()) continue;
-    
+    // Skip current timezone unless we determined we should include it
+    if (static_cast<int>(tz_idx) == tzCurrIdx_ && !includeCurrentTz) continue;
+
     const auto* tz = tzList_[tz_idx] != nullptr ? tzList_[tz_idx] : local_zone();
     auto zt{zoned_time{tz, now}};
-    
+
     // Add newline before each entry except the first
     if (!first) {
       os << '\n';
     }
     first = false;
-    
+
     // Use timezone-tooltip-format if specified, otherwise use format_
     const std::string& fmt = tzTooltipFormat_.empty() ? format_ : tzTooltipFormat_;
     os << fmt_lib::vformat(m_locale_, fmt, fmt_lib::make_format_args(zt));
