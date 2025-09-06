@@ -161,7 +161,10 @@ auto waybar::modules::Clock::update() -> void {
     const zoned_time shiftedNow{
         tz, local_days(shiftedDay) + (now.get_local_time() - floor<days>(now.get_local_time()))};
 
-    if (tzInTooltip_) tzText_ = getTZtext(now.get_sys_time());
+    if (tzInTooltip_) {
+      spdlog::debug("Clock::update - Generating timezone tooltip, current format_='{}'", format_);
+      tzText_ = getTZtext(now.get_sys_time());
+    }
     if (cldInTooltip_) cldText_ = get_calendar(today, shiftedDay, tz);
     if (ordInTooltip_) ordText_ = get_ordinal_date(shiftedDay);
     if (tzInTooltip_ || cldInTooltip_ || ordInTooltip_) {
@@ -191,23 +194,66 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
   std::stringstream os;
   bool first = true;
   
-  // Determine if we should include the current timezone in the tooltip
-  // The tooltip format to use (either custom or fallback to main format)
+  // Determine the format to use for tooltip entries
   const std::string& tooltipFormat = tzTooltipFormat_.empty() ? format_ : tzTooltipFormat_;
   
-  // Check if formats contain timezone info
-  bool tooltipHasTz = (tooltipFormat.find("%Z") != std::string::npos || 
-                       tooltipFormat.find("%z") != std::string::npos);
-  bool mainHasTz = (format_.find("%Z") != std::string::npos || 
-                    format_.find("%z") != std::string::npos);
+  // Helper lambda to check if a format string contains any timezone-related codes
+  auto hasTimezoneInFormat = [](const std::string& fmt) -> bool {
+    // Check for all possible timezone format codes
+    // Standard codes
+    if (fmt.find("%Z") != std::string::npos) return true;  // Timezone abbreviation (e.g., "EST")
+    if (fmt.find("%z") != std::string::npos) return true;  // Numeric timezone (e.g., "+0500")
+    
+    // Extended codes (may not be universally supported but check anyway)
+    if (fmt.find("%:z") != std::string::npos) return true;   // Extended numeric (e.g., "+05:00")
+    if (fmt.find("%::z") != std::string::npos) return true;  // With seconds (e.g., "+05:00:00")
+    if (fmt.find("%:::z") != std::string::npos) return true; // Minimal precision
+    
+    // Also check for escaped percent signs that might hide timezone codes
+    // For example, "%%Z" would print "%Z" literally, not a timezone
+    // We need to be careful not to match these
+    std::string temp = fmt;
+    size_t pos = 0;
+    while ((pos = temp.find("%%", pos)) != std::string::npos) {
+      // Replace %% with something that won't match our patterns
+      temp[pos] = ' ';
+      temp[pos + 1] = ' ';
+      pos += 2;
+    }
+    
+    // Re-check on the cleaned string
+    return (temp.find("%Z") != std::string::npos || 
+            temp.find("%z") != std::string::npos ||
+            temp.find("%:z") != std::string::npos ||
+            temp.find("%::z") != std::string::npos ||
+            temp.find("%:::z") != std::string::npos);
+  };
   
-  // Include current timezone only if:
-  // 1. Tooltip format has timezone info AND main format doesn't (avoid redundancy)
-  // 2. OR if a custom tooltip format is specified with TZ while main doesn't have TZ
-  bool includeCurrentTz = tooltipHasTz && !mainHasTz;
+  // Check if the currently active format contains timezone
+  bool currentFormatHasTz = hasTimezoneInFormat(format_);
+  
+  // Determine if we should include the current timezone in the tooltip
+  // Default behavior: exclude current timezone to avoid redundancy
+  bool includeCurrentTz = false;
+  
+  // Special case: if timezone-tooltip-format is set AND contains timezone info
+  // AND the currently active format doesn't show timezone, then include current TZ
+  if (!tzTooltipFormat_.empty()) {
+    bool tooltipHasTz = hasTimezoneInFormat(tzTooltipFormat_);
+    // Only include current TZ if tooltip has TZ and current format doesn't
+    includeCurrentTz = tooltipHasTz && !currentFormatHasTz;
+  }
+  // If no custom tooltip format, never include current timezone (original behavior)
+  // This prevents redundancy when format already shows timezone
+  
+  // Debug logging to help diagnose timezone tooltip issues
+  spdlog::debug("Clock::getTZtext - format_='{}', tzTooltipFormat_='{}', tooltipFormat='{}'", 
+                format_, tzTooltipFormat_, tooltipFormat);
+  spdlog::debug("Clock::getTZtext - currentFormatHasTz={}, includeCurrentTz={}, tzCurrIdx={}", 
+                currentFormatHasTz, includeCurrentTz, tzCurrIdx_);
 
   for (size_t tz_idx{0}; tz_idx < tzList_.size(); ++tz_idx) {
-    // Skip current timezone unless we determined we should include it
+    // Skip current timezone unless we explicitly want to include it
     if (static_cast<int>(tz_idx) == tzCurrIdx_ && !includeCurrentTz) continue;
 
     const auto* tz = tzList_[tz_idx] != nullptr ? tzList_[tz_idx] : local_zone();
@@ -219,7 +265,7 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
     }
     first = false;
 
-    // Use the same format determined earlier
+    // Use the tooltip format
     os << fmt_lib::vformat(m_locale_, tooltipFormat, fmt_lib::make_format_args(zt));
   }
 
