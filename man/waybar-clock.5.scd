@@ -42,11 +42,10 @@ $XDG_CONFIG_HOME/waybar/config ++
 |[ *timezone-tooltip-format*
 :[ string
 :[
-:[ Format to use for displaying timezones in the tooltip. When set with timezone
-   format codes (%Z or %z) while the main *format* doesn't contain them, the current
-   timezone will also be included in the tooltip list. This allows showing timezone
-   information in the tooltip while keeping the main display clean. Uses the same
-   format options as *format*
+:[ Format to use for displaying other timezones in the tooltip. When set, this allows
+   showing timezone information for all non-current timezones in the tooltip while
+   keeping the main display clean. The current/active timezone is never shown in the
+   tooltip to avoid redundancy. Uses the same format options as *format*
 |[ *locale*
 :[ string
 :[
@@ -180,7 +179,7 @@ View all valid format options in *strftime(3)* or have a look https://en.cpprefe
 # FORMAT REPLACEMENTS
 
 - *{calendar}*: Current month calendar
-- *{tz_list}*: List of time in the rest timezones, if more than one timezone is set in the config
+- *{tz_list}*: List of time in other timezones (excluding current), if more than one timezone is set in the config
 - *{ordinal_date}*: The current day in (English) ordinal form, e.g. 21st
 
 # EXAMPLES
@@ -258,9 +257,8 @@ View all valid format options in *strftime(3)* or have a look https://en.cpprefe
 
 In this example:
 - The toolbar shows clean time without timezone (14:30)
-- The tooltip shows all timezones including the current one with abbreviations
-- The current timezone is included in the tooltip because *timezone-tooltip-format*
-  contains %Z but *format* doesn't
+- The tooltip shows only other timezones with abbreviations (not the current one)
+- The current timezone is never shown in the tooltip to avoid redundancy
 
 5. Using format-alt with timezone tooltip
 
@@ -286,8 +284,7 @@ In this example:
 - Main format shows just time (14:30)
 - Right-click switches to format-alt showing weekday and date (Mon 15 Jan 14:30)
 - Neither format shows timezone, keeping the toolbar clean
-- Tooltip always shows all timezones with abbreviations
-- Current timezone appears in tooltip only when the active format doesn't contain %Z
+- Tooltip always shows other timezones with abbreviations (never the current one)
 
 # STYLE
 
