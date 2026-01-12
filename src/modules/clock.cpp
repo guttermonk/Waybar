@@ -200,8 +200,8 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
   // Determine the format to use for tooltip entries
   const std::string& tooltipFormat = tzTooltipFormat_.empty() ? format_ : tzTooltipFormat_;
   
-  // Simple behavior: NEVER include current timezone in tooltip
-  // The tooltip only shows OTHER timezones
+  // Skip current timezone if timezone-tooltip-format is set
+  // When not set, show all timezones using the default format
   spdlog::debug("Clock::getTZtext - format_='{}', tzTooltipFormat_='{}', tooltipFormat='{}'", 
                 format_, tzTooltipFormat_, tooltipFormat);
   spdlog::debug("Clock::getTZtext - tzCurrIdx={} (will be skipped)", tzCurrIdx_);
@@ -216,14 +216,12 @@ auto waybar::modules::Clock::getTZtext(sys_seconds now) -> std::string {
     // Skip local timezone (nullptr) - never show it in tooltip
     if (tzList_[tz_idx] == nullptr) continue;
     
-    // Skip current timezone unless timezone-tooltip-format is specified
-    if (static_cast<int>(tz_idx) == tzCurrIdx_) {
+    // Skip current timezone if timezone-tooltip-format is specified
+    if (static_cast<int>(tz_idx) == tzCurrIdx_ && !tzTooltipFormat_.empty()) {
       const auto* tz = tzList_[tz_idx] != nullptr ? tzList_[tz_idx] : local_zone();
-      if (tzTooltipFormat_.empty()) {
-        spdlog::debug("Clock::getTZtext - Skipping timezone[{}]='{}' (current timezone)", 
-                      tz_idx, tz->name());
-        continue;
-      }
+      spdlog::debug("Clock::getTZtext - Skipping timezone[{}]='{}' (current timezone, timezone-tooltip-format is set)", 
+                    tz_idx, tz->name());
+      continue;
     }
     
     const auto* tz = tzList_[tz_idx] != nullptr ? tzList_[tz_idx] : local_zone();
