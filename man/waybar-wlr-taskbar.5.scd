@@ -57,6 +57,11 @@ Addressed by *wlr/taskbar*
 	default: false ++
 	If set to true, group tasks by their app_id. Cannot be used with 'active-first'.
 
+*sort-by-hyprland-workspaces*: ++
+	typeof: bool ++
+	default: false ++
+	If set to true, sort tasks by workspace ID first, then by position within each workspace (top-to-bottom, then left-to-right). This option only works when running under Hyprland. Cannot be used with 'active-first' or 'sort-by-app-id'.
+
 *on-click*: ++
 	typeof: string ++
 	The action which should be triggered when clicking on the application button with the left mouse button.
@@ -148,6 +153,67 @@ Invalid expressions (e.g., mismatched parentheses) are skipped.
 }
 ```
 
+# KEYBOARD NAVIGATION
+
+The taskbar module creates a Unix socket at */tmp/waybar-taskbar-$WAYLAND_DISPLAY.sock*
+that accepts commands for keyboard-based window switching. This allows implementing
+alt-tab functionality using compositor keybindings.
+
+*Commands:*
+
+*next*: Select the next task (starts from active window on first press)
+
+*prev*: Select the previous task (starts from active window on first press)
+
+*activate*: Activate the selected window and clear selection
+
+*clear*: Clear the selection without activating
+
+*refresh*: Force a refresh of the taskbar (useful after layout changes)
+
+*Hyprland Configuration Example:*
+
+To implement alt-tab window switching with proper Alt key release detection, you need
+the *taskbar-switcher* Hyprland plugin (included in the *hyprland-plugin/* directory).
+The plugin detects Alt release events which cannot be reliably handled with native
+Hyprland keybindings.
+
+First, load the plugin in your Hyprland config:
+
+```
+plugin = /path/to/taskbar-switcher.so
+```
+
+Then add keybindings for Alt+Tab navigation:
+
+```
+# Alt+Tab to cycle forward
+bind = ALT, Tab, exec, echo "next" | socat - UNIX-CONNECT:/tmp/waybar-taskbar-$WAYLAND_DISPLAY.sock
+
+# Alt+Shift+Tab to cycle backward
+bind = ALT SHIFT, Tab, exec, echo "prev" | socat - UNIX-CONNECT:/tmp/waybar-taskbar-$WAYLAND_DISPLAY.sock
+```
+
+The plugin automatically handles:
+- Detecting Alt+Tab press to enter switcher mode
+- Sending "activate" when Alt is released
+- Sending "clear" when Escape is pressed
+- Sending "activate" when Enter is pressed
+
+See the *hyprland-plugin/README.md* for build instructions and more details.
+
+*CSS Styling Example:*
+
+Style the keyboard selection indicator in your Waybar CSS:
+
+```
+#taskbar button.keyboard-selected {
+    background: rgba(255, 255, 255, 0.3);
+    border: 2px solid #88c0d0;
+    border-radius: 4px;
+}
+```
+
 # Style
 
 - *#taskbar*
@@ -156,3 +222,4 @@ Invalid expressions (e.g., mismatched parentheses) are skipped.
 - *#taskbar button.minimized*
 - *#taskbar button.active*
 - *#taskbar button.fullscreen*
+- *#taskbar button.keyboard-selected*

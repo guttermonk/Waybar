@@ -8,6 +8,9 @@
 #include <gtkmm/image.h>
 #include <gtkmm/label.h>
 #include <wayland-client.h>
+#include <glibmm/iochannel.h>
+#include <thread>
+#include <atomic>
 
 #include <map>
 #include <memory>
@@ -19,6 +22,7 @@
 #include "bar.hpp"
 #include "client.hpp"
 #include "giomm/desktopappinfo.h"
+#include "modules/hyprland/backend.hpp"
 #include "util/icon_loader.hpp"
 #include "util/json.hpp"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
@@ -140,11 +144,12 @@ class Task {
 
 using TaskPtr = std::unique_ptr<Task>;
 
-class Taskbar : public waybar::AModule {
+class Taskbar : public waybar::AModule, public hyprland::EventHandler {
  public:
   Taskbar(const std::string &, const waybar::Bar &, const Json::Value &);
   ~Taskbar();
   void update();
+  void onEvent(const std::string &ev) override;
 
  private:
   const waybar::Bar &bar_;
@@ -157,6 +162,24 @@ class Taskbar : public waybar::AModule {
 
   struct zwlr_foreign_toplevel_manager_v1 *manager_;
   struct wl_seat *seat_;
+  bool registered_for_hyprland_events_ = false;
+
+  // Keyboard navigation support
+  int selection_index_ = -1;
+  int socket_fd_ = -1;
+  std::string socket_path_;
+  std::thread socket_thread_;
+  std::atomic<bool> socket_running_{false};
+
+  void setupControlSocket();
+  void cleanupControlSocket();
+  void socketListener();
+  void handleCommand(const std::string &cmd);
+  void selectNext();
+  void selectPrev();
+  void activateSelected();
+  void clearSelection();
+  void updateSelection(int old_index);
 
  public:
   /* Callbacks for global registration */

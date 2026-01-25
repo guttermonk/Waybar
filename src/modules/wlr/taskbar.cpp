@@ -6,6 +6,10 @@
 #include <giomm/desktopappinfo.h>
 #include <gtkmm/icontheme.h>
 #include <spdlog/spdlog.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
 
 #include <algorithm>
 #include <cctype>
@@ -16,6 +20,7 @@
 #include <utility>
 
 #include "gdkmm/general.h"
+#include "modules/hyprland/backend.hpp"
 #include "glibmm/error.h"
 #include "glibmm/fileutils.h"
 #include "glibmm/refptr.h"
@@ -618,9 +623,33 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
   for (auto &t : tasks_) {
     t->handle_app_id(t->app_id().c_str());
   }
+
+  // Register for Hyprland events if sorting by Hyprland workspaces
+  if (config_["sort-by-hyprland-workspaces"].asBool()) {
+    const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (his != nullptr) {
+      hyprland::modulesReady = true;
+      if (!hyprland::gIPC) {
+        hyprland::gIPC = std::make_unique<hyprland::IPC>();
+      }
+      hyprland::gIPC->registerForIPC("movewindow", this);
+      hyprland::gIPC->registerForIPC("openwindow", this);
+      hyprland::gIPC->registerForIPC("closewindow", this);
+      hyprland::gIPC->registerForIPC("configreloaded", this);
+      registered_for_hyprland_events_ = true;
+      spdlog::debug("Taskbar registered for Hyprland IPC events");
+    }
+  }
+
+  // Setup control socket for keyboard navigation
+  setupControlSocket();
 }
 
 Taskbar::~Taskbar() {
+  cleanupControlSocket();
+  if (registered_for_hyprland_events_ && hyprland::gIPC) {
+    hyprland::gIPC->unregisterForIPC(this);
+  }
   if (manager_) {
     struct wl_display *display = Client::inst()->wl_display;
     /*
@@ -655,7 +684,251 @@ void Taskbar::update() {
     }
   }
 
+  if (config_["sort-by-hyprland-workspaces"].asBool() && hyprland::gIPC) {
+    // Check if Hyprland is running
+    const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (his != nullptr) {
+      try {
+        Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
+        if (clients.isArray()) {
+          // Build a map from (class, title) -> (workspace_id, y, x)
+          // for sorting by workspace order, then top-to-bottom, then left-to-right
+          struct ClientSortKey {
+            int workspace_id;
+            int y;  // top to bottom
+            int x;  // left to right
+          };
+          std::map<std::pair<std::string, std::string>, ClientSortKey> clientOrder;
+          for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
+            const auto& client = clients[i];
+            std::string cls = client["class"].asString();
+            std::string title = client["title"].asString();
+            int workspace_id = client["workspace"]["id"].asInt();
+            int x = client["at"][0].asInt();
+            int y = client["at"][1].asInt();
+            // Only store the first occurrence
+            if (clientOrder.find({cls, title}) == clientOrder.end()) {
+              clientOrder[{cls, title}] = {workspace_id, y, x};
+            }
+          }
+
+          // Sort tasks by workspace ID, then y position (top-to-bottom), then x position (left-to-right)
+          std::stable_sort(tasks_.begin(), tasks_.end(),
+                           [&clientOrder](const std::unique_ptr<Task> &a, const std::unique_ptr<Task> &b) {
+                             auto keyA = std::make_pair(a->app_id(), a->title());
+                             auto keyB = std::make_pair(b->app_id(), b->title());
+                             auto itA = clientOrder.find(keyA);
+                             auto itB = clientOrder.find(keyB);
+                             // If both found, compare by workspace, then y, then x
+                             if (itA != clientOrder.end() && itB != clientOrder.end()) {
+                               if (itA->second.workspace_id != itB->second.workspace_id) {
+                                 return itA->second.workspace_id < itB->second.workspace_id;
+                               }
+                               // Within same workspace, sort by y (top to bottom)
+                               if (itA->second.y != itB->second.y) {
+                                 return itA->second.y < itB->second.y;
+                               }
+                               // Same y, sort by x (left to right)
+                               return itA->second.x < itB->second.x;
+                             }
+                             // If only one found, prioritize the found one
+                             if (itA != clientOrder.end()) return true;
+                             if (itB != clientOrder.end()) return false;
+                             // If neither found, maintain relative order
+                             return false;
+                           });
+
+          for (unsigned long i = 0; i < tasks_.size(); i++) {
+            move_button(tasks_[i]->button, i);
+          }
+        }
+      } catch (const std::exception& e) {
+        spdlog::warn("Failed to query Hyprland clients for taskbar sorting: {}", e.what());
+      }
+    }
+  }
+
   AModule::update();
+}
+
+void Taskbar::onEvent(const std::string &ev) {
+  // Hyprland window event received - trigger update to re-sort
+  spdlog::debug("Taskbar received Hyprland event: {}", ev);
+  dp.emit();
+}
+
+void Taskbar::setupControlSocket() {
+  const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
+  std::string display_name = wayland_display ? wayland_display : "wayland-0";
+  socket_path_ = fmt::format("/tmp/waybar-taskbar-{}.sock", display_name);
+
+  // Remove existing socket file if it exists
+  unlink(socket_path_.c_str());
+
+  socket_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (socket_fd_ < 0) {
+    spdlog::error("Failed to create taskbar control socket: {}", strerror(errno));
+    return;
+  }
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+
+  if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    spdlog::error("Failed to bind taskbar control socket: {}", strerror(errno));
+    close(socket_fd_);
+    socket_fd_ = -1;
+    return;
+  }
+
+  if (listen(socket_fd_, 5) < 0) {
+    spdlog::error("Failed to listen on taskbar control socket: {}", strerror(errno));
+    close(socket_fd_);
+    socket_fd_ = -1;
+    return;
+  }
+
+  socket_running_ = true;
+  socket_thread_ = std::thread(&Taskbar::socketListener, this);
+  spdlog::info("Taskbar control socket listening at {}", socket_path_);
+}
+
+void Taskbar::cleanupControlSocket() {
+  socket_running_ = false;
+  if (socket_fd_ >= 0) {
+    shutdown(socket_fd_, SHUT_RDWR);
+    close(socket_fd_);
+    socket_fd_ = -1;
+  }
+  if (socket_thread_.joinable()) {
+    socket_thread_.join();
+  }
+  if (!socket_path_.empty()) {
+    unlink(socket_path_.c_str());
+  }
+}
+
+void Taskbar::socketListener() {
+  while (socket_running_) {
+    struct pollfd pfd;
+    pfd.fd = socket_fd_;
+    pfd.events = POLLIN;
+
+    int ret = poll(&pfd, 1, 100);  // 100ms timeout
+    if (ret <= 0) continue;
+
+    int client_fd = accept(socket_fd_, nullptr, nullptr);
+    if (client_fd < 0) {
+      if (socket_running_) {
+        spdlog::error("Error accepting connection: {}", strerror(errno));
+      }
+      continue;
+    }
+
+    char buffer[256];
+    ssize_t n = read(client_fd, buffer, sizeof(buffer) - 1);
+    close(client_fd);
+
+    if (n > 0) {
+      buffer[n] = '\0';
+      std::string line(buffer);
+
+      // Trim whitespace
+      line.erase(0, line.find_first_not_of(" \t\r\n"));
+      auto pos = line.find_last_not_of(" \t\r\n");
+      if (pos != std::string::npos) {
+        line.erase(pos + 1);
+      }
+
+      if (!line.empty()) {
+        spdlog::debug("Taskbar received command: {}", line);
+        // Dispatch to main thread
+        Glib::signal_idle().connect_once([this, line]() {
+          handleCommand(line);
+        });
+      }
+    }
+  }
+}
+
+void Taskbar::handleCommand(const std::string &cmd) {
+  if (cmd == "next") {
+    selectNext();
+  } else if (cmd == "prev") {
+    selectPrev();
+  } else if (cmd == "activate") {
+    activateSelected();
+  } else if (cmd == "clear" || cmd == "cancel") {
+    clearSelection();
+  } else if (cmd == "refresh") {
+    dp.emit();
+  } else {
+    spdlog::warn("Unknown taskbar command: {}", cmd);
+  }
+}
+
+void Taskbar::selectNext() {
+  if (tasks_.empty()) return;
+  
+  int old_index = selection_index_;
+  if (selection_index_ < 0) {
+    // Start from the active window, or first if none active
+    selection_index_ = 0;
+    for (size_t i = 0; i < tasks_.size(); ++i) {
+      if (tasks_[i]->active()) {
+        selection_index_ = static_cast<int>(i);
+        break;
+      }
+    }
+  } else {
+    selection_index_ = (selection_index_ + 1) % static_cast<int>(tasks_.size());
+  }
+  updateSelection(old_index);
+}
+
+void Taskbar::selectPrev() {
+  if (tasks_.empty()) return;
+  
+  int old_index = selection_index_;
+  if (selection_index_ < 0) {
+    // Start from the active window, or last if none active
+    selection_index_ = static_cast<int>(tasks_.size()) - 1;
+    for (size_t i = 0; i < tasks_.size(); ++i) {
+      if (tasks_[i]->active()) {
+        selection_index_ = static_cast<int>(i);
+        break;
+      }
+    }
+  } else {
+    selection_index_ = (selection_index_ - 1 + static_cast<int>(tasks_.size())) % static_cast<int>(tasks_.size());
+  }
+  updateSelection(old_index);
+}
+
+void Taskbar::activateSelected() {
+  if (selection_index_ >= 0 && selection_index_ < static_cast<int>(tasks_.size())) {
+    tasks_[selection_index_]->activate();
+  }
+  clearSelection();
+}
+
+void Taskbar::clearSelection() {
+  int old_index = selection_index_;
+  selection_index_ = -1;
+  updateSelection(old_index);
+}
+
+void Taskbar::updateSelection(int old_index) {
+  // Remove class from old selection
+  if (old_index >= 0 && old_index < static_cast<int>(tasks_.size())) {
+    tasks_[old_index]->button.get_style_context()->remove_class("keyboard-selected");
+  }
+  // Add class to new selection
+  if (selection_index_ >= 0 && selection_index_ < static_cast<int>(tasks_.size())) {
+    tasks_[selection_index_]->button.get_style_context()->add_class("keyboard-selected");
+  }
 }
 
 static void tm_handle_toplevel(void *data, struct zwlr_foreign_toplevel_manager_v1 *manager,
