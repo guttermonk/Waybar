@@ -12,6 +12,7 @@
 #include <poll.h>
 
 #include <algorithm>
+#include <numeric>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -32,7 +33,7 @@
 namespace waybar::modules::wlr {
 
 /* Task class implementation */
-uint32_t Task::global_id = 0;
+uint32_t Task::global_id = 1;  // Start from 1 so 0 can be used as "no window" sentinel
 
 static void tl_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
                             const char *title) {
@@ -345,6 +346,9 @@ void Task::handle_done() {
 
   if (state_ & ACTIVE) {
     button.get_style_context()->add_class("active");
+    spdlog::info("Task::handle_done: window became active - id={}, app_id={}, title={}", 
+                 id_, app_id_, title_);
+    tbar_->notifyActiveChanged(id_);
   } else if (!(state_ & ACTIVE)) {
     button.get_style_context()->remove_class("active");
   }
@@ -691,52 +695,74 @@ void Taskbar::update() {
       try {
         Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
         if (clients.isArray()) {
-          // Build a map from (class, title) -> (workspace_id, y, x)
-          // for sorting by workspace order, then top-to-bottom, then left-to-right
-          struct ClientSortKey {
+          // Build a list of all clients with their sort keys
+          // Using a vector to handle multiple windows with same class/title
+          struct ClientInfo {
+            std::string cls;
+            std::string title;
             int workspace_id;
-            int y;  // top to bottom
-            int x;  // left to right
+            int x;
+            int y;
           };
-          std::map<std::pair<std::string, std::string>, ClientSortKey> clientOrder;
+          std::vector<ClientInfo> allClients;
           for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
             const auto& client = clients[i];
-            std::string cls = client["class"].asString();
-            std::string title = client["title"].asString();
-            int workspace_id = client["workspace"]["id"].asInt();
-            int x = client["at"][0].asInt();
-            int y = client["at"][1].asInt();
-            // Only store the first occurrence
-            if (clientOrder.find({cls, title}) == clientOrder.end()) {
-              clientOrder[{cls, title}] = {workspace_id, y, x};
+            ClientInfo info;
+            info.cls = client["class"].asString();
+            info.title = client["title"].asString();
+            info.workspace_id = client["workspace"]["id"].asInt();
+            info.x = client["at"][0].asInt();
+            info.y = client["at"][1].asInt();
+            allClients.push_back(info);
+          }
+
+          // Sort clients by workspace, then x, then y
+          std::sort(allClients.begin(), allClients.end(),
+                    [](const ClientInfo &a, const ClientInfo &b) {
+                      if (a.workspace_id != b.workspace_id) return a.workspace_id < b.workspace_id;
+                      if (a.x != b.x) return a.x < b.x;
+                      return a.y < b.y;
+                    });
+
+          // Build a map from (class, title) to list of sort indices (for windows with same class/title)
+          std::map<std::pair<std::string, std::string>, std::vector<int>> clientIndices;
+          for (size_t i = 0; i < allClients.size(); ++i) {
+            auto key = std::make_pair(allClients[i].cls, allClients[i].title);
+            clientIndices[key].push_back(static_cast<int>(i));
+          }
+
+          // Track how many times we've seen each (class, title) pair during sorting
+          std::map<std::pair<std::string, std::string>, size_t> usedCount;
+
+          // Assign a sort index to each task
+          std::vector<int> taskSortIndex(tasks_.size(), INT_MAX);
+          for (size_t t = 0; t < tasks_.size(); ++t) {
+            auto key = std::make_pair(tasks_[t]->app_id(), tasks_[t]->title());
+            auto it = clientIndices.find(key);
+            if (it != clientIndices.end()) {
+              size_t &used = usedCount[key];
+              if (used < it->second.size()) {
+                taskSortIndex[t] = it->second[used];
+                ++used;
+              }
             }
           }
 
-          // Sort tasks by workspace ID, then y position (top-to-bottom), then x position (left-to-right)
-          std::stable_sort(tasks_.begin(), tasks_.end(),
-                           [&clientOrder](const std::unique_ptr<Task> &a, const std::unique_ptr<Task> &b) {
-                             auto keyA = std::make_pair(a->app_id(), a->title());
-                             auto keyB = std::make_pair(b->app_id(), b->title());
-                             auto itA = clientOrder.find(keyA);
-                             auto itB = clientOrder.find(keyB);
-                             // If both found, compare by workspace, then y, then x
-                             if (itA != clientOrder.end() && itB != clientOrder.end()) {
-                               if (itA->second.workspace_id != itB->second.workspace_id) {
-                                 return itA->second.workspace_id < itB->second.workspace_id;
-                               }
-                               // Within same workspace, sort by y (top to bottom)
-                               if (itA->second.y != itB->second.y) {
-                                 return itA->second.y < itB->second.y;
-                               }
-                               // Same y, sort by x (left to right)
-                               return itA->second.x < itB->second.x;
-                             }
-                             // If only one found, prioritize the found one
-                             if (itA != clientOrder.end()) return true;
-                             if (itB != clientOrder.end()) return false;
-                             // If neither found, maintain relative order
-                             return false;
+          // Sort tasks by their assigned sort index
+          std::vector<size_t> taskOrder(tasks_.size());
+          std::iota(taskOrder.begin(), taskOrder.end(), 0);
+          std::stable_sort(taskOrder.begin(), taskOrder.end(),
+                           [&taskSortIndex](size_t a, size_t b) {
+                             return taskSortIndex[a] < taskSortIndex[b];
                            });
+
+          // Reorder tasks_ according to taskOrder
+          std::vector<TaskPtr> sortedTasks;
+          sortedTasks.reserve(tasks_.size());
+          for (size_t idx : taskOrder) {
+            sortedTasks.push_back(std::move(tasks_[idx]));
+          }
+          tasks_ = std::move(sortedTasks);
 
           for (unsigned long i = 0; i < tasks_.size(); i++) {
             move_button(tasks_[i]->button, i);
@@ -874,14 +900,19 @@ void Taskbar::selectNext() {
   
   int old_index = selection_index_;
   if (selection_index_ < 0) {
-    // Start from the active window, or first if none active
-    selection_index_ = 0;
+    // Start from the previously active window (MRU order)
+    selection_index_ = 0;  // fallback to first
+    spdlog::info("Taskbar::selectNext: looking for previous_active_id_={}, current_active_id_={}", 
+                 previous_active_id_, current_active_id_);
     for (size_t i = 0; i < tasks_.size(); ++i) {
-      if (tasks_[i]->active()) {
+      spdlog::info("  Task[{}]: id={}, title={}, active={}", 
+                   i, tasks_[i]->id(), tasks_[i]->title(), tasks_[i]->active());
+      if (tasks_[i]->id() == previous_active_id_) {
         selection_index_ = static_cast<int>(i);
         break;
       }
     }
+    spdlog::info("Taskbar::selectNext: selected index {}", selection_index_);
   } else {
     selection_index_ = (selection_index_ + 1) % static_cast<int>(tasks_.size());
   }
@@ -893,10 +924,10 @@ void Taskbar::selectPrev() {
   
   int old_index = selection_index_;
   if (selection_index_ < 0) {
-    // Start from the active window, or last if none active
-    selection_index_ = static_cast<int>(tasks_.size()) - 1;
+    // Start from the previously active window (MRU order)
+    selection_index_ = static_cast<int>(tasks_.size()) - 1;  // fallback to last
     for (size_t i = 0; i < tasks_.size(); ++i) {
-      if (tasks_[i]->active()) {
+      if (tasks_[i]->id() == previous_active_id_) {
         selection_index_ = static_cast<int>(i);
         break;
       }
@@ -929,6 +960,16 @@ void Taskbar::updateSelection(int old_index) {
   if (selection_index_ >= 0 && selection_index_ < static_cast<int>(tasks_.size())) {
     tasks_[selection_index_]->button.get_style_context()->add_class("keyboard-selected");
   }
+}
+
+void Taskbar::notifyActiveChanged(uint32_t new_active_id) {
+  // Save the current active as previous, then update current
+  if (current_active_id_ != 0 && current_active_id_ != new_active_id) {
+    spdlog::info("Taskbar: previous_active changing from {} to {}, new current: {}", 
+                 previous_active_id_, current_active_id_, new_active_id);
+    previous_active_id_ = current_active_id_;
+  }
+  current_active_id_ = new_active_id;
 }
 
 static void tm_handle_toplevel(void *data, struct zwlr_foreign_toplevel_manager_v1 *manager,
@@ -1003,6 +1044,16 @@ void Taskbar::remove_button(Gtk::Button &bt) {
 }
 
 void Taskbar::remove_task(uint32_t id) {
+  // Clear stale IDs if the removed task was tracked
+  if (previous_active_id_ == id) {
+    spdlog::info("Taskbar: clearing previous_active_id_ {} (task closed)", id);
+    previous_active_id_ = 0;
+  }
+  if (current_active_id_ == id) {
+    spdlog::info("Taskbar: clearing current_active_id_ {} (task closed)", id);
+    current_active_id_ = 0;
+  }
+
   auto it = std::find_if(std::begin(tasks_), std::end(tasks_),
                          [id](const TaskPtr &p) { return p->id() == id; });
 

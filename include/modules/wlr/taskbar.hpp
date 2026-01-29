@@ -166,6 +166,8 @@ class Taskbar : public waybar::AModule, public hyprland::EventHandler {
 
   // Keyboard navigation support
   int selection_index_ = -1;
+  uint32_t current_active_id_ = 0;   // Track currently active window
+  uint32_t previous_active_id_ = 0;  // Track previously active window for MRU switching
   int socket_fd_ = -1;
   std::string socket_path_;
   std::thread socket_thread_;
@@ -182,6 +184,7 @@ class Taskbar : public waybar::AModule, public hyprland::EventHandler {
   void updateSelection(int old_index);
 
  public:
+  void notifyActiveChanged(uint32_t new_active_id);
   /* Callbacks for global registration */
   void register_manager(struct wl_registry *, uint32_t name, uint32_t version);
   void register_seat(struct wl_registry *, uint32_t name, uint32_t version);
