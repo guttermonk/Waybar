@@ -1,13 +1,13 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/event/EventBus.hpp>
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <cstring>
 #include <cstdlib>
-#include <unordered_map>
 #include <any>
 #include <string>
 
@@ -15,6 +15,9 @@ inline HANDLE PHANDLE = nullptr;
 
 // Track if we're in switcher mode (Alt+Tab was pressed)
 static bool g_switcherActive = false;
+
+// Event listener handle
+static CHyprSignalListener g_pKeyPressListener;
 
 static void sendToTaskbarSocket(const char* command) {
     const char* waylandDisplay = getenv("WAYLAND_DISPLAY");
@@ -42,23 +45,17 @@ static void sendToTaskbarSocket(const char* command) {
     close(sockfd);
 }
 
-static void onKeyPress(void* /* thisptr */, SCallbackInfo& info, std::any data) {
-    // Extract data from the map - this is the pattern that hyprshell uses
-    auto dataMap = std::any_cast<std::unordered_map<std::string, std::any>>(data);
-    
-    const auto keyboardIt = dataMap.find("keyboard");
-    const auto eventIt = dataMap.find("event");
-    
-    if (keyboardIt == dataMap.end() || eventIt == dataMap.end()) {
+static void onKeyPress(IKeyboard::SKeyEvent event, Event::SCallbackInfo& info) {
+    // Get the currently focused keyboard
+    auto keyboard = g_pInputManager->m_pActiveKeyboard.lock();
+    if (!keyboard) {
         return;
     }
     
-    const auto keyboard = std::any_cast<SP<IKeyboard>>(keyboardIt->second);
     if (g_pInputManager->shouldIgnoreVirtualKeyboard(keyboard)) {
         return;
     }
     
-    const auto event = std::any_cast<IKeyboard::SKeyEvent>(eventIt->second);
     const auto state = keyboard->m_xkbState;
     const uint32_t keycode = event.keycode + 8; // xkbcommon expects +8 from libinput
     const bool released = event.state == WL_KEYBOARD_KEY_STATE_RELEASED;
@@ -92,8 +89,6 @@ static void onKeyPress(void* /* thisptr */, SCallbackInfo& info, std::any data) 
     }
 }
 
-static SP<HOOK_CALLBACK_FN> g_pKeyPressHook = nullptr;
-
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
@@ -101,15 +96,15 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
     
-    g_pKeyPressHook = HyprlandAPI::registerCallbackDynamic(
-        PHANDLE,
-        "keyPress",
-        [](void* thisptr, SCallbackInfo& info, std::any data) { onKeyPress(thisptr, info, data); }
+    g_pKeyPressListener = Event::bus()->m_events.input.keyboard.key.listen(
+        [](IKeyboard::SKeyEvent event, Event::SCallbackInfo& info) {
+            onKeyPress(event, info);
+        }
     );
     
     return {"taskbar-switcher", "Detects Alt key release for taskbar window switcher", "Waybar", "1.0"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    g_pKeyPressHook.reset();
+    g_pKeyPressListener.reset();
 }
