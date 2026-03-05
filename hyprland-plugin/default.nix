@@ -2,8 +2,6 @@
 , stdenv
 , hyprland
 , pkg-config
-, pixman
-, libdrm
 }:
 
 stdenv.mkDerivation {
@@ -14,13 +12,11 @@ stdenv.mkDerivation {
 
   nativeBuildInputs = [
     pkg-config
-  ];
+  ] ++ hyprland.nativeBuildInputs;
 
   buildInputs = [
     hyprland
-    pixman
-    libdrm
-  ];
+  ] ++ hyprland.buildInputs;
 
   # Disable cmake - we use a custom g++ build
   dontUseCmakeConfigure = true;
@@ -30,7 +26,7 @@ stdenv.mkDerivation {
     runHook preBuild
     
     g++ -shared -fPIC -std=c++23 -O2 \
-      $(pkg-config --cflags hyprland pixman-1 libdrm) \
+      $(pkg-config --cflags hyprland) \
       -o taskbar-switcher.so \
       taskbar-switcher.cpp
     

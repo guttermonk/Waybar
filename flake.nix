@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    hyprland.url = "github:hyprwm/Hyprland";
     flake-compat = {
       url = "github:edolstra/flake-compat";
       flake = false;
@@ -10,7 +11,7 @@
   };
 
   outputs =
-    { self, nixpkgs, ... }:
+    { self, nixpkgs, hyprland, ... }:
     let
       inherit (nixpkgs) lib;
       genSystems =
@@ -123,6 +124,9 @@
       packages = genSystems (pkgs: {
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.waybar;
         inherit (pkgs) waybar;
+        taskbar-switcher-hyprland-plugin = pkgs.callPackage ./hyprland-plugin/default.nix {
+          hyprland = hyprland.packages.${pkgs.stdenv.hostPlatform.system}.hyprland;
+        };
       });
     };
 }

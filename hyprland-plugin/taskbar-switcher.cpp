@@ -8,7 +8,6 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdlib>
-#include <any>
 #include <string>
 
 inline HANDLE PHANDLE = nullptr;
@@ -16,7 +15,7 @@ inline HANDLE PHANDLE = nullptr;
 // Track if we're in switcher mode (Alt+Tab was pressed)
 static bool g_switcherActive = false;
 
-// Event listener handle
+// Event listener handle - must be kept alive to receive events
 static CHyprSignalListener g_pKeyPressListener;
 
 static void sendToTaskbarSocket(const char* command) {
@@ -45,14 +44,17 @@ static void sendToTaskbarSocket(const char* command) {
     close(sockfd);
 }
 
-static void onKeyPress(IKeyboard::SKeyEvent event, Event::SCallbackInfo& info) {
-    // Get the currently focused keyboard
-    auto keyboard = g_pInputManager->m_pActiveKeyboard.lock();
-    if (!keyboard) {
-        return;
+static void onKeyPress(const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
+    // Find an active, non-virtual keyboard from the list
+    SP<IKeyboard> keyboard = nullptr;
+    for (const auto& kb : g_pInputManager->m_keyboards) {
+        if (kb && kb->m_active && !g_pInputManager->shouldIgnoreVirtualKeyboard(kb)) {
+            keyboard = kb;
+            break;
+        }
     }
     
-    if (g_pInputManager->shouldIgnoreVirtualKeyboard(keyboard)) {
+    if (!keyboard) {
         return;
     }
     
@@ -96,8 +98,9 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
     
+    // Register for keyboard key events using the modern Event bus API
     g_pKeyPressListener = Event::bus()->m_events.input.keyboard.key.listen(
-        [](IKeyboard::SKeyEvent event, Event::SCallbackInfo& info) {
+        [](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
             onKeyPress(event, info);
         }
     );
@@ -106,5 +109,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    // Reset the listener to unregister
     g_pKeyPressListener.reset();
 }
