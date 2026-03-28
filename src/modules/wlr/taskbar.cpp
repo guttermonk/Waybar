@@ -10,6 +10,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <termios.h>
 
 #include <algorithm>
 #include <numeric>
@@ -19,6 +22,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <unordered_set>
 
 #include "gdkmm/general.h"
 #include "modules/hyprland/backend.hpp"
@@ -33,6 +37,77 @@
 namespace waybar::modules::wlr {
 
 /* Task class implementation */
+
+static const std::unordered_set<std::string> KNOWN_TERMINALS = {
+    "kitty", "alacritty", "foot", "wezterm", "wezterm-gui",
+    "gnome-terminal", "xterm", "urxvt", "st", "konsole",
+    "termite", "tilix", "rxvt", "mlterm"
+};
+
+static const std::unordered_set<std::string> KNOWN_SHELLS = {
+    "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "elvish"
+};
+
+// Walk /proc to find the foreground process name for the given terminal PID.
+// Returns "" when only a shell is in the foreground (fall back to terminal icon).
+// Returns the multiplexer name (e.g. "tmux") when one is running so its own
+// icon is used. Returns the app name (e.g. "yazi") for everything else.
+static std::string getForegroundProcessName(pid_t terminal_pid) {
+    // Step 1: find the PTY slave (/dev/pts/N) opened by this terminal
+    std::string pts_path;
+    {
+        std::string fd_dir = "/proc/" + std::to_string(terminal_pid) + "/fd";
+        DIR *d = opendir(fd_dir.c_str());
+        if (!d) return "";
+        struct dirent *ent;
+        while ((ent = readdir(d)) != nullptr) {
+            char link_buf[256] = {};
+            std::string fd_path = fd_dir + "/" + ent->d_name;
+            if (readlink(fd_path.c_str(), link_buf, sizeof(link_buf) - 1) > 0 &&
+                strncmp(link_buf, "/dev/pts/", 9) == 0) {
+                pts_path = link_buf;
+                break;
+            }
+        }
+        closedir(d);
+    }
+    if (pts_path.empty()) return "";
+
+    // Step 2: get the foreground process group of that PTY
+    int pts_fd = open(pts_path.c_str(), O_RDONLY | O_NOCTTY);
+    if (pts_fd < 0) return "";
+    pid_t fg_pgrp = tcgetpgrp(pts_fd);
+    close(pts_fd);
+    if (fg_pgrp <= 0) return "";
+
+    // Step 3: scan /proc for the first non-shell process in the foreground group
+    DIR *proc_dir = opendir("/proc");
+    if (!proc_dir) return "";
+    std::string result;
+    struct dirent *pent;
+    while ((pent = readdir(proc_dir)) != nullptr) {
+        bool is_numeric = true;
+        for (const char *c = pent->d_name; *c; ++c) {
+            if (!isdigit(static_cast<unsigned char>(*c))) { is_numeric = false; break; }
+        }
+        if (!is_numeric) continue;
+
+        std::string stat_path = "/proc/" + std::string(pent->d_name) + "/stat";
+        FILE *f = fopen(stat_path.c_str(), "r");
+        if (!f) continue;
+        int pid_val, ppid, pgrp;
+        char comm[256], state;
+        int ret = fscanf(f, "%d (%255[^)]) %c %d %d", &pid_val, comm, &state, &ppid, &pgrp);
+        fclose(f);
+        if (ret < 5) continue;
+        if (static_cast<pid_t>(pgrp) == fg_pgrp && !KNOWN_SHELLS.count(comm)) {
+            result = comm;
+            break;
+        }
+    }
+    closedir(proc_dir);
+    return result;
+}
 uint32_t Task::global_id = 1;  // Start from 1 so 0 can be used as "no window" sentinel
 
 static void tl_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
@@ -204,12 +279,22 @@ void Task::handle_title(const char *title) {
   title_ = title;
   hide_if_ignored();
 
-  if (!with_icon_ && !with_name_ || app_info_) {
+  if (!with_icon_ && !with_name_) {
     return;
   }
 
-  app_info_ = IconLoader::get_app_info_from_app_id_list(title_);
-  name_ = app_info_ ? app_info_->get_display_name() : title;
+  // For terminal emulators re-evaluate the foreground process on every title
+  // change — the title changing is the signal that a new program started.
+  if (KNOWN_TERMINALS.count(app_id_)) {
+    if (tryUpdateIconFromTerminalFg()) return;
+    // fg detection failed — fall back to the terminal's own icon
+    app_info_ = IconLoader::get_app_info_from_app_id_list(app_id_);
+    name_ = app_info_ ? app_info_->get_display_name() : app_id_.c_str();
+  } else {
+    if (app_info_) return; // non-terminal: icon already set by handle_app_id
+    app_info_ = IconLoader::get_app_info_from_app_id_list(title_);
+    name_ = app_info_ ? app_info_->get_display_name() : title;
+  }
 
   if (!with_icon_) {
     return;
@@ -219,7 +304,7 @@ void Task::handle_title(const char *title) {
   if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size))
     icon_.show();
   else
-    spdlog::debug("Couldn't find icon for {}", title_);
+    spdlog::debug("Couldn't find icon for {}", app_id_.empty() ? title : app_id_.c_str());
 }
 
 void Task::set_minimize_hint() {
@@ -277,6 +362,74 @@ void Task::handle_app_id(const char *app_id) {
     icon_.show();
   else
     spdlog::debug("Couldn't find icon for {}", app_id_);
+
+  // For terminals that were already open when Waybar started, try immediately
+  // to show the foreground process icon (title may not have arrived yet, but
+  // it's worth attempting with whatever we have).
+  if (KNOWN_TERMINALS.count(app_id_)) {
+    tryUpdateIconFromTerminalFg();
+  }
+}
+
+// Query Hyprland IPC for the PID of the window matching this task, then walk
+// /proc to find what is running in the terminal's foreground.
+// Multiplexers (tmux, zellij, …) are returned as-is so their own icon is shown.
+// Returns true and updates icon_/app_info_/name_ on success.
+bool Task::tryUpdateIconFromTerminalFg() {
+  if (!with_icon_ && !with_name_) return false;
+  if (!hyprland::gIPC) return false;
+  if (std::getenv("HYPRLAND_INSTANCE_SIGNATURE") == nullptr) return false;
+
+  try {
+    Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
+    if (!clients.isArray()) return false;
+
+    // Match this task to a Hyprland client by class + title to get its PID
+    pid_t term_pid = -1;
+    for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
+      const auto &client = clients[i];
+      if (client["class"].asString() == app_id_ &&
+          client["title"].asString() == title_) {
+        term_pid = static_cast<pid_t>(client["pid"].asInt());
+        break;
+      }
+    }
+    if (term_pid <= 0) return false;
+
+    std::string fg_name = getForegroundProcessName(term_pid);
+    if (fg_name.empty()) return false;
+
+    spdlog::debug("Task ({}): terminal {} fg process is '{}'", id_, app_id_, fg_name);
+
+    int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
+
+    // Try to resolve a .desktop entry for the foreground process
+    auto fg_info = IconLoader::get_app_info_from_app_id_list(fg_name);
+    if (fg_info) {
+      app_info_ = fg_info;
+      name_ = fg_info->get_display_name();
+      if (with_icon_) {
+        if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size))
+          icon_.show();
+      }
+      return true;
+    }
+
+    // No .desktop entry — try the process name directly as an icon name
+    if (with_icon_) {
+      auto icon_theme = Gtk::IconTheme::get_default();
+      if (icon_theme->has_icon(fg_name)) {
+        icon_.set_from_icon_name(fg_name, Gtk::ICON_SIZE_INVALID);
+        icon_.set_pixel_size(icon_size);
+        icon_.show();
+        name_ = fg_name;
+        return true;
+      }
+    }
+  } catch (const std::exception &e) {
+    spdlog::debug("Task ({}): tryUpdateIconFromTerminalFg failed: {}", id_, e.what());
+  }
+  return false;
 }
 
 void Task::on_button_size_allocated(Gtk::Allocation &alloc) {

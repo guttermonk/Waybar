@@ -95,6 +95,7 @@ class Task {
   void set_minimize_hint();
   void on_button_size_allocated(Gtk::Allocation &alloc);
   void hide_if_ignored();
+  bool tryUpdateIconFromTerminalFg();
 
  public:
   /* Getter functions */
