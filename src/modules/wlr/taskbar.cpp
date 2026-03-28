@@ -392,23 +392,36 @@ void Task::handle_app_id(const char *app_id) {
 // Returns true and updates icon_/app_info_/name_ on success.
 bool Task::tryUpdateIconFromTerminalFg() {
   if (!with_icon_ && !with_name_) return false;
-  if (!hyprland::gIPC) return false;
-  if (std::getenv("HYPRLAND_INSTANCE_SIGNATURE") == nullptr) return false;
+  const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+  if (his == nullptr) return false;
+  // Lazily initialize IPC if it hasn't been set up yet (e.g. when
+  // sort-by-hyprland-workspaces is not enabled in the config).
+  if (!hyprland::gIPC) {
+    hyprland::modulesReady = true;
+    hyprland::gIPC = std::make_unique<hyprland::IPC>();
+  }
 
   try {
     Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
     if (!clients.isArray()) return false;
 
-    // Match this task to a Hyprland client by class + title to get its PID
+    // Match this task to a Hyprland client by class + title to get its PID.
+    // Fall back to class-only if no exact title match exists — the title seen
+    // by the wlr protocol and by Hyprland IPC can diverge slightly in timing.
     pid_t term_pid = -1;
+    pid_t class_only_pid = -1;
     for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
       const auto &client = clients[i];
-      if (client["class"].asString() == app_id_ &&
-          client["title"].asString() == title_) {
-        term_pid = static_cast<pid_t>(client["pid"].asInt());
-        break;
+      if (client["class"].asString() == app_id_) {
+        if (client["title"].asString() == title_) {
+          term_pid = static_cast<pid_t>(client["pid"].asInt());
+          break;
+        } else if (class_only_pid < 0) {
+          class_only_pid = static_cast<pid_t>(client["pid"].asInt());
+        }
       }
     }
+    if (term_pid <= 0) term_pid = class_only_pid;
     if (term_pid <= 0) return false;
 
     std::string fg_name = getForegroundProcessName(term_pid);
@@ -800,14 +813,22 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
     t->handle_app_id(t->app_id().c_str());
   }
 
-  // Register for Hyprland events if sorting by Hyprland workspaces
-  if (config_["sort-by-hyprland-workspaces"].asBool()) {
+  // Initialize Hyprland IPC unconditionally when running under Hyprland so
+  // that terminal foreground icon detection works regardless of other settings.
+  {
     const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
     if (his != nullptr) {
       hyprland::modulesReady = true;
       if (!hyprland::gIPC) {
         hyprland::gIPC = std::make_unique<hyprland::IPC>();
       }
+    }
+  }
+
+  // Register for Hyprland events if sorting by Hyprland workspaces
+  if (config_["sort-by-hyprland-workspaces"].asBool()) {
+    const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (his != nullptr) {
       hyprland::gIPC->registerForIPC("movewindow", this);
       hyprland::gIPC->registerForIPC("openwindow", this);
       hyprland::gIPC->registerForIPC("closewindow", this);
