@@ -74,7 +74,7 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
     if (pts_path.empty()) return "";
 
     // Step 2: get the foreground process group of that PTY
-    int pts_fd = open(pts_path.c_str(), O_RDONLY | O_NOCTTY);
+    int pts_fd = open(pts_path.c_str(), O_WRONLY | O_NOCTTY);
     if (pts_fd < 0) return "";
     pid_t fg_pgrp = tcgetpgrp(pts_fd);
     close(pts_fd);
@@ -108,6 +108,21 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
     closedir(proc_dir);
     return result;
 }
+// Search all installed .desktop files for one whose Exec= basename matches
+// proc_name. Handles apps where the binary name differs from the desktop file
+// name, e.g. hx (helix) or vi (neovim).
+static Glib::RefPtr<Gio::DesktopAppInfo> findAppInfoByExec(const std::string &proc_name) {
+    for (const auto &app : Gio::AppInfo::get_all()) {
+        auto desktop = Glib::RefPtr<Gio::DesktopAppInfo>::cast_dynamic(app);
+        if (!desktop) continue;
+        std::string exec = app->get_executable();
+        auto slash = exec.rfind('/');
+        if (slash != std::string::npos) exec = exec.substr(slash + 1);
+        if (exec == proc_name) return desktop;
+    }
+    return {};
+}
+
 uint32_t Task::global_id = 1;  // Start from 1 so 0 can be used as "no window" sentinel
 
 static void tl_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
@@ -403,8 +418,12 @@ bool Task::tryUpdateIconFromTerminalFg() {
 
     int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
 
-    // Try to resolve a .desktop entry for the foreground process
+    // Try to resolve a .desktop entry for the foreground process.
+    // First attempt: match by app-id (looks for <fg_name>.desktop).
+    // Second attempt: scan all desktop files for one whose Exec= basename
+    //   matches the process name — catches cases like hx → Helix.desktop.
     auto fg_info = IconLoader::get_app_info_from_app_id_list(fg_name);
+    if (!fg_info) fg_info = findAppInfoByExec(fg_name);
     if (fg_info) {
       app_info_ = fg_info;
       name_ = fg_info->get_display_name();
