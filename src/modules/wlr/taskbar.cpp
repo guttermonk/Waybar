@@ -179,6 +179,68 @@ static Glib::RefPtr<Gio::DesktopAppInfo> findAppInfoByExec(const std::string &pr
     return it != s_cache.end() ? it->second : Glib::RefPtr<Gio::DesktopAppInfo>{};
 }
 
+// Load an app icon as a software (window-independent) Cairo surface.
+//
+// The shared IconLoader::image_load_icon() passes image.get_window() to
+// gdk_cairo_surface_create_from_pixbuf(), which ties the surface to that
+// specific GdkWindow. When a screencopy tool (Satty, grim, etc.) causes GTK
+// to reset its style/surface state, those window-backed surfaces go stale
+// and every icon shows the broken-image symbol.
+//
+// This helper is intentionally scoped to the taskbar module. It mirrors the
+// IconLoader lookup logic but passes a null window so the resulting surface is
+// a plain software image that survives any window lifecycle event.
+static bool load_icon_software(Gtk::Image &image,
+                                const Glib::RefPtr<Gio::DesktopAppInfo> &app_info,
+                                const IconLoader &loader,
+                                int size) {
+    if (!app_info) return false;
+
+    int scaled_size = size * image.get_scale_factor();
+
+    // Determine icon name: try startup WM class in each custom theme first,
+    // then fall back to the icon declared in the desktop entry.
+    std::string icon_name;
+    std::string wm_class = app_info->get_startup_wm_class();
+    for (const auto &theme : loader.custom_themes()) {
+        if (!wm_class.empty() && theme->lookup_icon(wm_class, scaled_size)) {
+            icon_name = wm_class;
+            break;
+        }
+    }
+    if (icon_name.empty() && app_info->get_icon())
+        icon_name = app_info->get_icon()->to_string();
+    if (icon_name.empty())
+        icon_name = "unknown";
+
+    // Load pixbuf: custom themes first, then system default (includes hicolor).
+    Glib::RefPtr<Gdk::Pixbuf> pixbuf;
+    for (const auto &theme : loader.custom_themes()) {
+        try {
+            pixbuf = theme->load_icon(icon_name, scaled_size, Gtk::ICON_LOOKUP_FORCE_SIZE);
+            if (pixbuf) break;
+        } catch (...) {}
+    }
+    if (!pixbuf) {
+        try {
+            pixbuf = Gtk::IconTheme::get_default()->load_icon(
+                icon_name, scaled_size, Gtk::ICON_LOOKUP_FORCE_SIZE);
+        } catch (...) {}
+    }
+    if (!pixbuf) return false;
+
+    if (pixbuf->get_width() != scaled_size) {
+        int w = scaled_size * pixbuf->get_width() / pixbuf->get_height();
+        pixbuf = pixbuf->scale_simple(w, scaled_size, Gdk::InterpType::INTERP_BILINEAR);
+    }
+
+    // Null window → CAIRO_SURFACE_TYPE_IMAGE (software), never goes stale.
+    auto surface = Gdk::Cairo::create_surface_from_pixbuf(
+        pixbuf, image.get_scale_factor(), {});
+    image.set(surface);
+    return true;
+}
+
 uint32_t Task::global_id = 1;  // Start from 1 so 0 can be used as "no window" sentinel
 
 static void tl_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
@@ -528,7 +590,7 @@ bool Task::tryUpdateIconFromTerminalFg() {
       app_info_ = fg_info;
       name_ = fg_info->get_display_name();
       if (with_icon_) {
-        if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size))
+        if (load_icon_software(icon_, app_info_, tbar_->icon_loader(), icon_size))
           icon_.show();
       }
       return true;
@@ -812,20 +874,18 @@ void Task::minimize(bool set) {
     zwlr_foreign_toplevel_handle_v1_unset_minimized(handle_);
 }
 
-// Re-run icon loading with the current app_info_. Called when the GTK icon
-// theme fires signal_changed() (e.g. triggered by a screencopy portal request
-// from Satty or similar tools), which can invalidate native-backed Cairo
-// surfaces that were created with image.get_window().
+// Re-run icon loading using software surfaces so icons survive any GTK
+// window/style reset (e.g. screencopy tools causing surface invalidation).
 void Task::reload_icon() {
   if (!with_icon_) return;
   int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
+  const auto &loader = tbar_->icon_loader();
   if (app_info_) {
-    if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size))
+    if (load_icon_software(icon_, app_info_, loader, icon_size))
       icon_.show();
   } else {
-    // app_info_ wasn't set — fall back to app_id lookup
     auto fallback = IconLoader::get_app_info_from_app_id_list(app_id_);
-    if (fallback && tbar_->icon_loader().image_load_icon(icon_, fallback, icon_size))
+    if (fallback && load_icon_software(icon_, fallback, loader, icon_size))
       icon_.show();
   }
 }
