@@ -560,6 +560,8 @@ void Task::on_button_size_allocated(Gtk::Allocation &alloc) {
 }
 
 void Task::handle_output_enter(struct wl_output *output) {
+  spdlog::warn("handle_output_enter: app_id='{}' title='{}' button_visible={}",
+               app_id_, title_, button_visible_);
   if (ignored_) {
     spdlog::debug("{} is ignored", repr());
     return;
@@ -579,14 +581,15 @@ void Task::handle_output_enter(struct wl_output *output) {
 }
 
 void Task::handle_output_leave(struct wl_output *output) {
-  spdlog::debug("{} left output {}", repr(), (void *)output);
+  spdlog::warn("handle_output_leave: app_id='{}' title='{}' button_visible={}",
+               app_id_, title_, button_visible_);
 
   if (button_visible_ && !tbar_->all_outputs() && tbar_->show_output(output)) {
     /* The task left the output of the current bar, make the button invisible */
+    spdlog::warn("handle_output_leave: REMOVING button for '{}'", app_id_);
     tbar_->remove_button(button);
     button.hide();
     button_visible_ = false;
-    spdlog::debug("{} now invisible on {}", repr(), bar_.output->name);
   }
 }
 
@@ -859,20 +862,24 @@ void Task::activate() {
         }
         if (addr.empty()) { addr = class_only_addr; matched_client = class_only_client; }
         if (!addr.empty()) {
-          // Switch workspace first so the cross-workspace move uses the
-          // `workspace` dispatch (which respects cursor.warp_on_change_workspace).
-          // A plain `focuswindow` across workspaces has its own unconditional
-          // cursor warp that ignores that setting.
           int win_ws = matched_client["workspace"]["id"].asInt();
           try {
             Json::Value activeWs = hyprland::gIPC->getSocket1JsonReply("activeworkspace");
             int cur_ws = activeWs["id"].asInt();
             if (win_ws != cur_ws) {
-              spdlog::warn("activate: switching workspace {} → {}", cur_ws, win_ws);
+              // Different workspace: use only `dispatch workspace N` — this
+              // mirrors what keyboard shortcuts do and respects
+              // cursor.warp_on_change_workspace. `focuswindow` has its own
+              // unconditional cursor warp when crossing workspaces that no
+              // setting can suppress without cursor.no_warps = true.
+              spdlog::warn("activate: switching workspace {} → {} (workspace-only dispatch)",
+                           cur_ws, win_ws);
               hyprland::IPC::getSocket1Reply("dispatch workspace " + std::to_string(win_ws));
+              return;
             }
           } catch (...) {}
 
+          // Same workspace: focus the specific window.
           std::string cmd = "dispatch focuswindow address:" + addr;
           spdlog::warn("activate: dispatching '{}' for app_id='{}' title='{}'",
                        cmd, app_id_, title_);
