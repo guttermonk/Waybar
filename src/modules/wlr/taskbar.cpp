@@ -840,6 +840,8 @@ void Task::activate() {
         // Try exact class+title match first, then fall back to class only.
         std::string addr;
         std::string class_only_addr;
+        Json::Value matched_client;
+        Json::Value class_only_client;
         for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
           const auto &c = clients[i];
           spdlog::warn("activate: checking client class='{}' title='{}' addr='{}'",
@@ -847,14 +849,30 @@ void Task::activate() {
           if (c["class"].asString() == app_id_) {
             if (c["title"].asString() == title_) {
               addr = c["address"].asString();
+              matched_client = c;
               break;
             } else if (class_only_addr.empty()) {
               class_only_addr = c["address"].asString();
+              class_only_client = c;
             }
           }
         }
-        if (addr.empty()) addr = class_only_addr;
+        if (addr.empty()) { addr = class_only_addr; matched_client = class_only_client; }
         if (!addr.empty()) {
+          // Switch workspace first so the cross-workspace move uses the
+          // `workspace` dispatch (which respects cursor.warp_on_change_workspace).
+          // A plain `focuswindow` across workspaces has its own unconditional
+          // cursor warp that ignores that setting.
+          int win_ws = matched_client["workspace"]["id"].asInt();
+          try {
+            Json::Value activeWs = hyprland::gIPC->getSocket1JsonReply("activeworkspace");
+            int cur_ws = activeWs["id"].asInt();
+            if (win_ws != cur_ws) {
+              spdlog::warn("activate: switching workspace {} → {}", cur_ws, win_ws);
+              hyprland::IPC::getSocket1Reply("dispatch workspace " + std::to_string(win_ws));
+            }
+          } catch (...) {}
+
           std::string cmd = "dispatch focuswindow address:" + addr;
           spdlog::warn("activate: dispatching '{}' for app_id='{}' title='{}'",
                        cmd, app_id_, title_);
@@ -1328,7 +1346,7 @@ void Taskbar::updateSelection(int old_index) {
 }
 
 void Taskbar::notifyIconThemeChanged() {
-  spdlog::debug("Taskbar: icon theme changed, reloading all task icons");
+  spdlog::warn("Taskbar: icon theme signal_changed fired, reloading all task icons");
   for (auto &t : tasks_) {
     t->reload_icon();
   }
