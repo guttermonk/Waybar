@@ -799,7 +799,43 @@ void Task::minimize(bool set) {
     zwlr_foreign_toplevel_handle_v1_unset_minimized(handle_);
 }
 
-void Task::activate() { zwlr_foreign_toplevel_handle_v1_activate(handle_, seat_); }
+void Task::activate() {
+  // When running under Hyprland, use its own focuswindow dispatch rather than
+  // the wlr foreign-toplevel activate call. The wlr path causes Hyprland to
+  // warp the cursor to the centre of the screen on workspace switches; the
+  // dispatch path uses the same code as keyboard shortcuts and leaves the
+  // cursor where it is.
+  if (hyprland::gIPC && std::getenv("HYPRLAND_INSTANCE_SIGNATURE")) {
+    try {
+      Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
+      if (clients.isArray()) {
+        // Try exact class+title match first, then fall back to class only.
+        std::string addr;
+        std::string class_only_addr;
+        for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
+          const auto &c = clients[i];
+          if (c["class"].asString() == app_id_) {
+            if (c["title"].asString() == title_) {
+              addr = c["address"].asString();
+              break;
+            } else if (class_only_addr.empty()) {
+              class_only_addr = c["address"].asString();
+            }
+          }
+        }
+        if (addr.empty()) addr = class_only_addr;
+        if (!addr.empty()) {
+          hyprland::IPC::getSocket1Reply("dispatch focuswindow address:" + addr);
+          return;
+        }
+      }
+    } catch (const std::exception &e) {
+      spdlog::warn("Task::activate: Hyprland dispatch failed: {}", e.what());
+    }
+  }
+  // Fallback for non-Hyprland compositors.
+  zwlr_foreign_toplevel_handle_v1_activate(handle_, seat_);
+}
 
 void Task::fullscreen(bool set) {
   if (zwlr_foreign_toplevel_handle_v1_get_version(handle_) <
