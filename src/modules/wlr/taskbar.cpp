@@ -158,15 +158,25 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
 // proc_name. Handles apps where the binary name differs from the desktop file
 // name, e.g. hx (helix) or vi (neovim).
 static Glib::RefPtr<Gio::DesktopAppInfo> findAppInfoByExec(const std::string &proc_name) {
-    for (const auto &app : Gio::AppInfo::get_all()) {
-        auto desktop = Glib::RefPtr<Gio::DesktopAppInfo>::cast_dynamic(app);
-        if (!desktop) continue;
-        std::string exec = app->get_executable();
-        auto slash = exec.rfind('/');
-        if (slash != std::string::npos) exec = exec.substr(slash + 1);
-        if (exec == proc_name) return desktop;
+    // Build the exec→desktop map once. Calling Gio::AppInfo::get_all() on
+    // every title-change event emits a GIO "changed" signal that causes GTK
+    // to invalidate its icon theme cache, wiping all taskbar icons at once.
+    static std::unordered_map<std::string, Glib::RefPtr<Gio::DesktopAppInfo>> s_cache;
+    static bool s_built = false;
+    if (!s_built) {
+        s_built = true;
+        for (const auto &app : Gio::AppInfo::get_all()) {
+            auto desktop = Glib::RefPtr<Gio::DesktopAppInfo>::cast_dynamic(app);
+            if (!desktop) continue;
+            std::string exec = app->get_executable();
+            auto slash = exec.rfind('/');
+            if (slash != std::string::npos) exec = exec.substr(slash + 1);
+            if (s_cache.find(exec) == s_cache.end())
+                s_cache[exec] = desktop;
+        }
     }
-    return {};
+    auto it = s_cache.find(proc_name);
+    return it != s_cache.end() ? it->second : Glib::RefPtr<Gio::DesktopAppInfo>{};
 }
 
 uint32_t Task::global_id = 1;  // Start from 1 so 0 can be used as "no window" sentinel
