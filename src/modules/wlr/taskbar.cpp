@@ -46,6 +46,15 @@ static const std::unordered_set<std::string> KNOWN_SHELLS = {
     "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "elvish"
 };
 
+// Case-insensitive terminal check — app_id values differ across compositors
+// (e.g. Hyprland reports "Alacritty" while the binary is "alacritty").
+static bool isKnownTerminal(const std::string &id) {
+    std::string lower = id;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return KNOWN_TERMINALS.count(lower) > 0;
+}
+
 // Walk /proc to find the foreground process name for the given terminal PID.
 // Returns "" when only a shell is in the foreground (fall back to terminal icon).
 // Returns the multiplexer name (e.g. "tmux") when one is running so its own
@@ -117,7 +126,7 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
                      child->pid, child->comm, child->pgrp, child->tpgid);
 
         // Skip the terminal's own helper processes and nested terminals.
-        if (SKIP_PROCS.count(child->comm) || KNOWN_TERMINALS.count(child->comm)) continue;
+        if (SKIP_PROCS.count(child->comm) || isKnownTerminal(child->comm)) continue;
 
         if (KNOWN_SHELLS.count(child->comm)) {
             // The child is a shell. tpgid tells us what is in the foreground.
@@ -265,7 +274,10 @@ Task::Task(const waybar::Bar &bar, const Json::Value &config, Taskbar *tbar,
     if (config_["tooltip-format"].isString())
       format_tooltip_ = config_["tooltip-format"].asString();
     else
-      format_tooltip_ = "{title}";
+      // Default to {name} so fg process display names show in tooltips.
+      // Users can override with tooltip-format: "{title}" to get the raw
+      // window title back.
+      format_tooltip_ = "{name}";
   }
 
   /* Handle click events if configured */
@@ -337,7 +349,7 @@ void Task::handle_title(const char *title) {
 
   // For terminal emulators re-evaluate the foreground process on every title
   // change — the title changing is the signal that a new program started.
-  if (KNOWN_TERMINALS.count(app_id_)) {
+  if (isKnownTerminal(app_id_)) {
     if (tryUpdateIconFromTerminalFg()) return;
     // fg detection failed — fall back to the terminal's own icon
     app_info_ = IconLoader::get_app_info_from_app_id_list(app_id_);
@@ -418,7 +430,7 @@ void Task::handle_app_id(const char *app_id) {
   // For terminals that were already open when Waybar started, try immediately
   // to show the foreground process icon (title may not have arrived yet, but
   // it's worth attempting with whatever we have).
-  if (KNOWN_TERMINALS.count(app_id_)) {
+  if (isKnownTerminal(app_id_)) {
     tryUpdateIconFromTerminalFg();
   }
 }
