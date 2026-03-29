@@ -11,8 +11,6 @@
 #include <sys/un.h>
 #include <poll.h>
 #include <dirent.h>
-#include <fcntl.h>
-#include <termios.h>
 
 #include <algorithm>
 #include <numeric>
@@ -52,20 +50,30 @@ static const std::unordered_set<std::string> KNOWN_SHELLS = {
 // Returns "" when only a shell is in the foreground (fall back to terminal icon).
 // Returns the multiplexer name (e.g. "tmux") when one is running so its own
 // icon is used. Returns the app name (e.g. "yazi") for everything else.
+//
+// Uses only /proc/[pid]/stat — no tcgetpgrp, no ioctl, no permission issues.
+// stat field layout: pid (comm) state ppid pgrp session tty_nr tpgid ...
+//   tpgid (field 8) is the foreground process group of the controlling terminal.
 static std::string getForegroundProcessName(pid_t terminal_pid) {
-    // Terminal emulators hold the PTY master (/dev/ptmx), not the slave.
-    // The PTY slave (/dev/pts/N) is held by the child shell process.
-    // Step 1: scan /proc for direct children of terminal_pid and find the
-    // one that has a /dev/pts/N fd — that is the shell kitty/foot/etc spawned.
-    std::string pts_path;
+    // Processes to ignore when scanning children of the terminal.
+    // "kitten" is kitty's own internal helper, not a real application.
+    static const std::unordered_set<std::string> SKIP_PROCS = { "kitten" };
+
+    struct ProcInfo {
+        pid_t pid;
+        std::string comm;
+        pid_t ppid;
+        pid_t pgrp;
+        pid_t tpgid; // foreground pgrp of the controlling terminal
+    };
+
+    // Single pass: read every /proc/[pid]/stat entry we can access.
+    std::vector<ProcInfo> all_procs;
     {
         DIR *proc_dir = opendir("/proc");
-        if (!proc_dir) {
-            spdlog::warn("fgicon: cannot open /proc");
-            return "";
-        }
+        if (!proc_dir) return "";
         struct dirent *pent;
-        while ((pent = readdir(proc_dir)) != nullptr && pts_path.empty()) {
+        while ((pent = readdir(proc_dir)) != nullptr) {
             bool is_numeric = true;
             for (const char *c = pent->d_name; *c; ++c) {
                 if (!isdigit(static_cast<unsigned char>(*c))) { is_numeric = false; break; }
@@ -75,82 +83,68 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
             std::string stat_path = "/proc/" + std::string(pent->d_name) + "/stat";
             FILE *f = fopen(stat_path.c_str(), "r");
             if (!f) continue;
-            int pid_val, ppid, pgrp;
-            char comm[256], state;
-            int ret = fscanf(f, "%d (%255[^)]) %c %d %d", &pid_val, comm, &state, &ppid, &pgrp);
-            fclose(f);
-            if (ret < 5 || ppid != static_cast<int>(terminal_pid)) continue;
 
-            // This process is a direct child of the terminal — look for pts slave
-            std::string fd_dir = "/proc/" + std::string(pent->d_name) + "/fd";
-            DIR *d = opendir(fd_dir.c_str());
-            if (!d) continue;
-            struct dirent *ent;
-            while ((ent = readdir(d)) != nullptr) {
-                char link_buf[256] = {};
-                std::string fd_path = fd_dir + "/" + ent->d_name;
-                if (readlink(fd_path.c_str(), link_buf, sizeof(link_buf) - 1) > 0 &&
-                    strncmp(link_buf, "/dev/pts/", 9) == 0) {
-                    pts_path = link_buf;
-                    break;
-                }
-            }
-            closedir(d);
+            ProcInfo info;
+            char comm_buf[256] = {};
+            int ppid = 0, pgrp = 0, session = 0, tty_nr = 0, tpgid = 0;
+            int ret = fscanf(f, "%d (%255[^)]) %*c %d %d %d %d %d",
+                             &info.pid, comm_buf, &ppid, &pgrp, &session, &tty_nr, &tpgid);
+            fclose(f);
+            if (ret < 7) continue;
+
+            info.comm  = comm_buf;
+            info.ppid  = static_cast<pid_t>(ppid);
+            info.pgrp  = static_cast<pid_t>(pgrp);
+            info.tpgid = static_cast<pid_t>(tpgid);
+            all_procs.push_back(std::move(info));
         }
         closedir(proc_dir);
     }
-    if (pts_path.empty()) {
-        spdlog::warn("fgicon: no pts device found in children of pid {}", terminal_pid);
+
+    // Collect direct children of the terminal PID.
+    std::vector<const ProcInfo *> children;
+    for (const auto &p : all_procs) {
+        if (p.ppid == terminal_pid) children.push_back(&p);
+    }
+
+    if (children.empty()) {
+        spdlog::warn("fgicon: no children found for pid {}", terminal_pid);
         return "";
     }
-    spdlog::warn("fgicon: pid {} child pts device is {}", terminal_pid, pts_path);
 
-    // Step 2: get the foreground process group of that PTY slave
-    int pts_fd = open(pts_path.c_str(), O_WRONLY | O_NOCTTY);
-    if (pts_fd < 0) {
-        spdlog::warn("fgicon: cannot open {} (errno {})", pts_path, errno);
-        return "";
-    }
-    pid_t fg_pgrp = tcgetpgrp(pts_fd);
-    close(pts_fd);
-    if (fg_pgrp <= 0) {
-        spdlog::warn("fgicon: tcgetpgrp failed on {} (errno {})", pts_path, errno);
-        return "";
-    }
-    spdlog::warn("fgicon: fg process group is {}", fg_pgrp);
+    for (const auto *child : children) {
+        spdlog::warn("fgicon: child pid={} comm='{}' pgrp={} tpgid={}",
+                     child->pid, child->comm, child->pgrp, child->tpgid);
 
-    // Step 3: scan /proc for the first non-shell process in the foreground group
-    DIR *proc_dir = opendir("/proc");
-    if (!proc_dir) return "";
-    std::string result;
-    struct dirent *pent;
-    while ((pent = readdir(proc_dir)) != nullptr) {
-        bool is_numeric = true;
-        for (const char *c = pent->d_name; *c; ++c) {
-            if (!isdigit(static_cast<unsigned char>(*c))) { is_numeric = false; break; }
-        }
-        if (!is_numeric) continue;
+        // Skip the terminal's own helper processes and nested terminals.
+        if (SKIP_PROCS.count(child->comm) || KNOWN_TERMINALS.count(child->comm)) continue;
 
-        std::string stat_path = "/proc/" + std::string(pent->d_name) + "/stat";
-        FILE *f = fopen(stat_path.c_str(), "r");
-        if (!f) continue;
-        int pid_val, ppid, pgrp;
-        char comm[256], state;
-        int ret = fscanf(f, "%d (%255[^)]) %c %d %d", &pid_val, comm, &state, &ppid, &pgrp);
-        fclose(f);
-        if (ret < 5) continue;
-        if (static_cast<pid_t>(pgrp) == fg_pgrp && !KNOWN_SHELLS.count(comm)) {
-            result = comm;
-            break;
+        if (KNOWN_SHELLS.count(child->comm)) {
+            // The child is a shell. tpgid tells us what is in the foreground.
+            pid_t fg_pgrp = child->tpgid;
+            if (fg_pgrp <= 0 || fg_pgrp == child->pgrp) {
+                // Shell itself is in the foreground — nothing interesting running.
+                spdlog::warn("fgicon: shell '{}' is in foreground, skipping", child->comm);
+                continue;
+            }
+            // Find the process in the foreground group.
+            for (const auto &p : all_procs) {
+                if (p.pgrp == fg_pgrp && !KNOWN_SHELLS.count(p.comm)) {
+                    spdlog::warn("fgicon: fg process is '{}' (pgrp {})", p.comm, fg_pgrp);
+                    return p.comm;
+                }
+            }
+        } else {
+            // Non-shell direct child of the terminal (e.g. kitty running yazi directly).
+            spdlog::warn("fgicon: direct non-shell child is '{}'", child->comm);
+            return child->comm;
         }
     }
-    closedir(proc_dir);
-    if (result.empty())
-        spdlog::warn("fgicon: no non-shell process found in group {}", fg_pgrp);
-    else
-        spdlog::warn("fgicon: fg process name is '{}'", result);
-    return result;
+
+    spdlog::warn("fgicon: no foreground app found for terminal pid {}", terminal_pid);
+    return "";
 }
+
 // Search all installed .desktop files for one whose Exec= basename matches
 // proc_name. Handles apps where the binary name differs from the desktop file
 // name, e.g. hx (helix) or vi (neovim).
