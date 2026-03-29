@@ -824,6 +824,8 @@ void Task::activate() {
         std::string class_only_addr;
         for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
           const auto &c = clients[i];
+          spdlog::warn("activate: checking client class='{}' title='{}' addr='{}'",
+                       c["class"].asString(), c["title"].asString(), c["address"].asString());
           if (c["class"].asString() == app_id_) {
             if (c["title"].asString() == title_) {
               addr = c["address"].asString();
@@ -835,15 +837,22 @@ void Task::activate() {
         }
         if (addr.empty()) addr = class_only_addr;
         if (!addr.empty()) {
-          hyprland::IPC::getSocket1Reply("dispatch focuswindow address:" + addr);
+          std::string cmd = "dispatch focuswindow address:" + addr;
+          spdlog::warn("activate: dispatching '{}' for app_id='{}' title='{}'",
+                       cmd, app_id_, title_);
+          std::string reply = hyprland::IPC::getSocket1Reply(cmd);
+          spdlog::warn("activate: reply='{}'", reply);
           return;
         }
+        spdlog::warn("activate: no address found for app_id='{}' title='{}', falling back to wlr",
+                     app_id_, title_);
       }
     } catch (const std::exception &e) {
       spdlog::warn("Task::activate: Hyprland dispatch failed: {}", e.what());
     }
   }
   // Fallback for non-Hyprland compositors.
+  spdlog::warn("activate: using wlr protocol for app_id='{}' title='{}'", app_id_, title_);
   zwlr_foreign_toplevel_handle_v1_activate(handle_, seat_);
 }
 
