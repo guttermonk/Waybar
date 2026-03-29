@@ -96,9 +96,9 @@ class Task {
   void on_button_size_allocated(Gtk::Allocation &alloc);
   void hide_if_ignored();
   bool tryUpdateIconFromTerminalFg();
-  void reload_icon();
 
  public:
+  void reload_icon();
   /* Getter functions */
   uint32_t id() const { return id_; }
   std::string title() const { return title_; }
