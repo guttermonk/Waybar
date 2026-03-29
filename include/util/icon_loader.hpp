@@ -31,4 +31,7 @@ class IconLoader {
                        int size) const;
   static Glib::RefPtr<Gio::DesktopAppInfo> get_app_info_from_app_id_list(
       const std::string &app_id_list);
+  const std::vector<Glib::RefPtr<Gtk::IconTheme>> &custom_themes() const {
+    return custom_icon_themes_;
+  }
 };

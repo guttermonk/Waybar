@@ -809,6 +809,24 @@ void Task::minimize(bool set) {
     zwlr_foreign_toplevel_handle_v1_unset_minimized(handle_);
 }
 
+// Re-run icon loading with the current app_info_. Called when the GTK icon
+// theme fires signal_changed() (e.g. triggered by a screencopy portal request
+// from Satty or similar tools), which can invalidate native-backed Cairo
+// surfaces that were created with image.get_window().
+void Task::reload_icon() {
+  if (!with_icon_) return;
+  int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
+  if (app_info_) {
+    if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size))
+      icon_.show();
+  } else {
+    // app_info_ wasn't set — fall back to app_id lookup
+    auto fallback = IconLoader::get_app_info_from_app_id_list(app_id_);
+    if (fallback && tbar_->icon_loader().image_load_icon(icon_, fallback, icon_size))
+      icon_.show();
+  }
+}
+
 void Task::activate() {
   // When running under Hyprland, use its own focuswindow dispatch rather than
   // the wlr foreign-toplevel activate call. The wlr path causes Hyprland to
@@ -984,6 +1002,16 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
 
   // Setup control socket for keyboard navigation
   setupControlSocket();
+
+  // Reload all task icons whenever the GTK icon theme signals a change.
+  // This handles cases like Satty (screencopy portal) triggering a theme
+  // invalidation that stales native-backed Cairo surfaces on all icons.
+  Gtk::IconTheme::get_default()->signal_changed().connect(
+      sigc::mem_fun(*this, &Taskbar::notifyIconThemeChanged));
+  for (auto &custom_theme : icon_loader_.custom_themes()) {
+    custom_theme->signal_changed().connect(
+        sigc::mem_fun(*this, &Taskbar::notifyIconThemeChanged));
+  }
 }
 
 Taskbar::~Taskbar() {
@@ -1297,6 +1325,14 @@ void Taskbar::updateSelection(int old_index) {
   if (selection_index_ >= 0 && selection_index_ < static_cast<int>(tasks_.size())) {
     tasks_[selection_index_]->button.get_style_context()->add_class("keyboard-selected");
   }
+}
+
+void Taskbar::notifyIconThemeChanged() {
+  spdlog::debug("Taskbar: icon theme changed, reloading all task icons");
+  for (auto &t : tasks_) {
+    t->reload_icon();
+  }
+  dp.emit();
 }
 
 void Taskbar::notifyActiveChanged(uint32_t new_active_id) {

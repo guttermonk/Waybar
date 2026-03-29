@@ -96,6 +96,7 @@ class Task {
   void on_button_size_allocated(Gtk::Allocation &alloc);
   void hide_if_ignored();
   bool tryUpdateIconFromTerminalFg();
+  void reload_icon();
 
  public:
   /* Getter functions */
@@ -187,6 +188,7 @@ class Taskbar : public waybar::AModule, public hyprland::EventHandler {
 
  public:
   void notifyActiveChanged(uint32_t new_active_id);
+  void notifyIconThemeChanged();
   /* Callbacks for global registration */
   void register_manager(struct wl_registry *, uint32_t name, uint32_t version);
   void register_seat(struct wl_registry *, uint32_t name, uint32_t version);
