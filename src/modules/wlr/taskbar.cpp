@@ -117,13 +117,13 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
     }
 
     if (children.empty()) {
-        spdlog::warn("fgicon: no children found for pid {}", terminal_pid);
+        spdlog::debug("fgicon: no children found for pid {}", terminal_pid);
         return "";
     }
 
     for (const auto *child : children) {
-        spdlog::warn("fgicon: child pid={} comm='{}' pgrp={} tpgid={}",
-                     child->pid, child->comm, child->pgrp, child->tpgid);
+        spdlog::debug("fgicon: child pid={} comm='{}' pgrp={} tpgid={}",
+                      child->pid, child->comm, child->pgrp, child->tpgid);
 
         // Skip the terminal's own helper processes and nested terminals.
         if (SKIP_PROCS.count(child->comm) || isKnownTerminal(child->comm)) continue;
@@ -133,24 +133,24 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
             pid_t fg_pgrp = child->tpgid;
             if (fg_pgrp <= 0 || fg_pgrp == child->pgrp) {
                 // Shell itself is in the foreground — nothing interesting running.
-                spdlog::warn("fgicon: shell '{}' is in foreground, skipping", child->comm);
+                spdlog::debug("fgicon: shell '{}' is in foreground, skipping", child->comm);
                 continue;
             }
             // Find the process in the foreground group.
             for (const auto &p : all_procs) {
                 if (p.pgrp == fg_pgrp && !KNOWN_SHELLS.count(p.comm)) {
-                    spdlog::warn("fgicon: fg process is '{}' (pgrp {})", p.comm, fg_pgrp);
+                    spdlog::debug("fgicon: fg process is '{}' (pgrp {})", p.comm, fg_pgrp);
                     return p.comm;
                 }
             }
         } else {
             // Non-shell direct child of the terminal (e.g. kitty running yazi directly).
-            spdlog::warn("fgicon: direct non-shell child is '{}'", child->comm);
+            spdlog::debug("fgicon: direct non-shell child is '{}'", child->comm);
             return child->comm;
         }
     }
 
-    spdlog::warn("fgicon: no foreground app found for terminal pid {}", terminal_pid);
+    spdlog::debug("fgicon: no foreground app found for terminal pid {}", terminal_pid);
     return "";
 }
 
@@ -512,20 +512,20 @@ void Task::handle_app_id(const char *app_id) {
 // Multiplexers (tmux, zellij, …) are returned as-is so their own icon is shown.
 // Returns true and updates icon_/app_info_/name_ on success.
 bool Task::tryUpdateIconFromTerminalFg() {
-  spdlog::warn("fgicon: tryUpdateIconFromTerminalFg called for app_id='{}' title='{}'", app_id_, title_);
+  spdlog::debug("fgicon: tryUpdateIconFromTerminalFg called for app_id='{}' title='{}'", app_id_, title_);
   if (!with_icon_ && !with_name_) {
-    spdlog::warn("fgicon: skipping — with_icon_={} with_name_={}", with_icon_, with_name_);
+    spdlog::debug("fgicon: skipping — with_icon_={} with_name_={}", with_icon_, with_name_);
     return false;
   }
   const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
   if (his == nullptr) {
-    spdlog::warn("fgicon: HYPRLAND_INSTANCE_SIGNATURE not set");
+    spdlog::debug("fgicon: HYPRLAND_INSTANCE_SIGNATURE not set");
     return false;
   }
   // Lazily initialize IPC if it hasn't been set up yet (e.g. when
   // sort-by-hyprland-workspaces is not enabled in the config).
   if (!hyprland::gIPC) {
-    spdlog::warn("fgicon: gIPC is null, initializing");
+    spdlog::debug("fgicon: gIPC is null, initializing");
     hyprland::modulesReady = true;
     hyprland::gIPC = std::make_unique<hyprland::IPC>();
   }
@@ -533,10 +533,10 @@ bool Task::tryUpdateIconFromTerminalFg() {
   try {
     Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
     if (!clients.isArray()) {
-      spdlog::warn("fgicon: clients IPC reply is not an array");
+      spdlog::debug("fgicon: clients IPC reply is not an array");
       return false;
     }
-    spdlog::warn("fgicon: got {} clients from IPC", clients.size());
+    spdlog::debug("fgicon: got {} clients from IPC", clients.size());
 
     // Match this task to a Hyprland client by class + title to get its PID.
     // Fall back to class-only if no exact title match exists — the title seen
@@ -545,8 +545,8 @@ bool Task::tryUpdateIconFromTerminalFg() {
     pid_t class_only_pid = -1;
     for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
       const auto &client = clients[i];
-      spdlog::warn("fgicon: client[{}] class='{}' title='{}'", i,
-                   client["class"].asString(), client["title"].asString());
+      spdlog::debug("fgicon: client[{}] class='{}' title='{}'", i,
+                    client["class"].asString(), client["title"].asString());
       if (client["class"].asString() == app_id_) {
         if (client["title"].asString() == title_) {
           term_pid = static_cast<pid_t>(client["pid"].asInt());
@@ -558,10 +558,10 @@ bool Task::tryUpdateIconFromTerminalFg() {
     }
     if (term_pid <= 0) term_pid = class_only_pid;
     if (term_pid <= 0) {
-      spdlog::warn("fgicon: no matching client found for app_id='{}'", app_id_);
+      spdlog::debug("fgicon: no matching client found for app_id='{}'", app_id_);
       return false;
     }
-    spdlog::warn("fgicon: matched pid={}", term_pid);
+    spdlog::debug("fgicon: matched pid={}", term_pid);
 
     std::string fg_name = getForegroundProcessName(term_pid);
     if (fg_name.empty()) return false;
@@ -572,11 +572,11 @@ bool Task::tryUpdateIconFromTerminalFg() {
     const auto &fg_map = tbar_->fg_process_map();
     auto fg_map_it = fg_map.find(fg_name);
     if (fg_map_it != fg_map.end()) {
-      spdlog::warn("fgicon: remapping '{}' → '{}' via fg-process-mapping", fg_name, fg_map_it->second);
+      spdlog::debug("fgicon: remapping '{}' → '{}' via fg-process-mapping", fg_name, fg_map_it->second);
       fg_name = fg_map_it->second;
     }
 
-    spdlog::warn("fgicon: terminal {} fg process is '{}'", app_id_, fg_name);
+    spdlog::debug("fgicon: terminal {} fg process is '{}'", app_id_, fg_name);
 
     int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
 
@@ -607,9 +607,9 @@ bool Task::tryUpdateIconFromTerminalFg() {
         return true;
       }
     }
-    spdlog::warn("fgicon: no desktop entry or icon found for '{}'", fg_name);
+    spdlog::debug("fgicon: no desktop entry or icon found for '{}'", fg_name);
   } catch (const std::exception &e) {
-    spdlog::warn("fgicon: exception: {}", e.what());
+    spdlog::debug("fgicon: exception: {}", e.what());
   }
   return false;
 }
@@ -622,8 +622,8 @@ void Task::on_button_size_allocated(Gtk::Allocation &alloc) {
 }
 
 void Task::handle_output_enter(struct wl_output *output) {
-  spdlog::warn("handle_output_enter: app_id='{}' title='{}' button_visible={}",
-               app_id_, title_, button_visible_);
+  spdlog::debug("handle_output_enter: app_id='{}' title='{}' button_visible={}",
+                app_id_, title_, button_visible_);
   if (ignored_) {
     spdlog::debug("{} is ignored", repr());
     return;
@@ -643,12 +643,12 @@ void Task::handle_output_enter(struct wl_output *output) {
 }
 
 void Task::handle_output_leave(struct wl_output *output) {
-  spdlog::warn("handle_output_leave: app_id='{}' title='{}' button_visible={}",
-               app_id_, title_, button_visible_);
+  spdlog::debug("handle_output_leave: app_id='{}' title='{}' button_visible={}",
+                app_id_, title_, button_visible_);
 
   if (button_visible_ && !tbar_->all_outputs() && tbar_->show_output(output)) {
     /* The task left the output of the current bar, make the button invisible */
-    spdlog::warn("handle_output_leave: REMOVING button for '{}'", app_id_);
+    spdlog::debug("handle_output_leave: REMOVING button for '{}'", app_id_);
     tbar_->remove_button(button);
     button.hide();
     button_visible_ = false;
@@ -907,8 +907,8 @@ void Task::activate() {
         Json::Value class_only_client;
         for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
           const auto &c = clients[i];
-          spdlog::warn("activate: checking client class='{}' title='{}' addr='{}'",
-                       c["class"].asString(), c["title"].asString(), c["address"].asString());
+          spdlog::debug("activate: checking client class='{}' title='{}' addr='{}'",
+                        c["class"].asString(), c["title"].asString(), c["address"].asString());
           if (c["class"].asString() == app_id_) {
             if (c["title"].asString() == title_) {
               addr = c["address"].asString();
@@ -932,8 +932,8 @@ void Task::activate() {
               // cursor.warp_on_change_workspace. `focuswindow` has its own
               // unconditional cursor warp when crossing workspaces that no
               // setting can suppress without cursor.no_warps = true.
-              spdlog::warn("activate: switching workspace {} → {} (workspace-only dispatch)",
-                           cur_ws, win_ws);
+              spdlog::debug("activate: switching workspace {} → {} (workspace-only dispatch)",
+                            cur_ws, win_ws);
               hyprland::IPC::getSocket1Reply("dispatch workspace " + std::to_string(win_ws));
               return;
             }
@@ -941,21 +941,21 @@ void Task::activate() {
 
           // Same workspace: focus the specific window.
           std::string cmd = "dispatch focuswindow address:" + addr;
-          spdlog::warn("activate: dispatching '{}' for app_id='{}' title='{}'",
-                       cmd, app_id_, title_);
+          spdlog::debug("activate: dispatching '{}' for app_id='{}' title='{}'",
+                        cmd, app_id_, title_);
           std::string reply = hyprland::IPC::getSocket1Reply(cmd);
-          spdlog::warn("activate: reply='{}'", reply);
+          spdlog::debug("activate: reply='{}'", reply);
           return;
         }
-        spdlog::warn("activate: no address found for app_id='{}' title='{}', falling back to wlr",
-                     app_id_, title_);
+        spdlog::debug("activate: no address found for app_id='{}' title='{}', falling back to wlr",
+                      app_id_, title_);
       }
     } catch (const std::exception &e) {
       spdlog::warn("Task::activate: Hyprland dispatch failed: {}", e.what());
     }
   }
   // Fallback for non-Hyprland compositors.
-  spdlog::warn("activate: using wlr protocol for app_id='{}' title='{}'", app_id_, title_);
+  spdlog::debug("activate: using wlr protocol for app_id='{}' title='{}'", app_id_, title_);
   zwlr_foreign_toplevel_handle_v1_activate(handle_, seat_);
 }
 
@@ -1101,7 +1101,7 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
   // fullscreen screencopy tool like Satty briefly unmaps the bar layer). Cairo
   // surfaces created with image.get_window() become stale for the new window.
   box_.signal_realize().connect([this]() {
-    spdlog::warn("Taskbar: box_ realized — reloading all task icons");
+    spdlog::debug("Taskbar: box_ realized — reloading all task icons");
     for (auto &t : tasks_) {
       t->reload_icon();
     }
@@ -1110,10 +1110,10 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
 
   // Diagnostic: log when the bar surface is mapped/unmapped.
   box_.signal_map().connect([this]() {
-    spdlog::warn("Taskbar: box_ mapped");
+    spdlog::debug("Taskbar: box_ mapped");
   });
   box_.signal_unmap().connect([]() {
-    spdlog::warn("Taskbar: box_ unmapped");
+    spdlog::debug("Taskbar: box_ unmapped");
   });
 }
 
@@ -1431,7 +1431,7 @@ void Taskbar::updateSelection(int old_index) {
 }
 
 void Taskbar::notifyIconThemeChanged() {
-  spdlog::warn("Taskbar: icon theme signal_changed fired, reloading all task icons");
+  spdlog::debug("Taskbar: icon theme signal_changed fired, reloading all task icons");
   for (auto &t : tasks_) {
     t->reload_icon();
   }

@@ -126,33 +126,7 @@ bool IconLoader::image_load_icon(Gtk::Image &image, const Glib::RefPtr<Gtk::Icon
 
   try {
     pixbuf = icon_theme->load_icon(ret_icon_name, scaled_icon_size, Gtk::ICON_LOOKUP_FORCE_SIZE);
-  } catch (const Glib::Error &e) {
-    spdlog::warn("image_load_icon: Glib::Error loading '{}' size {}: {} (code {})",
-                 ret_icon_name, scaled_icon_size, e.what(), e.code());
-    if (Glib::file_test(ret_icon_name, Glib::FILE_TEST_EXISTS)) {
-      pixbuf = load_icon_from_file(ret_icon_name, scaled_icon_size);
-    } else {
-      try {
-        pixbuf = DefaultGtkIconThemeWrapper::load_icon(
-            "image-missing", scaled_icon_size, Gtk::IconLookupFlags::ICON_LOOKUP_FORCE_SIZE);
-      } catch (...) {
-        pixbuf = {};
-      }
-    }
-  } catch (const std::exception &e) {
-    spdlog::warn("image_load_icon: std::exception loading '{}': {}", ret_icon_name, e.what());
-    if (Glib::file_test(ret_icon_name, Glib::FILE_TEST_EXISTS)) {
-      pixbuf = load_icon_from_file(ret_icon_name, scaled_icon_size);
-    } else {
-      try {
-        pixbuf = DefaultGtkIconThemeWrapper::load_icon(
-            "image-missing", scaled_icon_size, Gtk::IconLookupFlags::ICON_LOOKUP_FORCE_SIZE);
-      } catch (...) {
-        pixbuf = {};
-      }
-    }
   } catch (...) {
-    spdlog::warn("image_load_icon: unknown exception loading '{}'", ret_icon_name);
     if (Glib::file_test(ret_icon_name, Glib::FILE_TEST_EXISTS)) {
       pixbuf = load_icon_from_file(ret_icon_name, scaled_icon_size);
     } else {
