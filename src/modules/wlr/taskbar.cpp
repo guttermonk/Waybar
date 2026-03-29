@@ -494,6 +494,16 @@ bool Task::tryUpdateIconFromTerminalFg() {
     std::string fg_name = getForegroundProcessName(term_pid);
     if (fg_name.empty()) return false;
 
+    // Apply fg-process-mapping: lets users remap wrapper scripts or processes
+    // with no .desktop file to a known app-id.
+    // e.g. "fg-process-mapping": { "zide": "zellij", "zellij": "zellij" }
+    const auto &fg_map = tbar_->fg_process_map();
+    auto fg_map_it = fg_map.find(fg_name);
+    if (fg_map_it != fg_map.end()) {
+      spdlog::warn("fgicon: remapping '{}' → '{}' via fg-process-mapping", fg_name, fg_map_it->second);
+      fg_name = fg_map_it->second;
+    }
+
     spdlog::warn("fgicon: terminal {} fg process is '{}'", app_id_, fg_name);
 
     int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
@@ -874,6 +884,17 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
     const std::vector<std::string> app_ids = config_["app_ids-mapping"].getMemberNames();
     for (auto &app_id : app_ids) {
       app_ids_replace_map_.emplace(app_id, mapping[app_id].asString());
+    }
+  }
+
+  // Load fg-process-mapping: maps a detected foreground process name to an
+  // app-id used for icon/name lookup. Useful for wrapper scripts (zide → zellij)
+  // or apps with no .desktop file (zellij → zellij icon name).
+  // Example config: "fg-process-mapping": { "zide": "zellij", "zellij": "zellij" }
+  if (config_["fg-process-mapping"].isObject()) {
+    const Json::Value &mapping = config_["fg-process-mapping"];
+    for (auto &key : config_["fg-process-mapping"].getMemberNames()) {
+      fg_process_map_.emplace(key, mapping[key].asString());
     }
   }
 
@@ -1340,6 +1361,10 @@ const std::unordered_set<std::string> &Taskbar::ignore_list() const { return ign
 
 const std::map<std::string, std::string> &Taskbar::app_ids_replace_map() const {
   return app_ids_replace_map_;
+}
+
+const std::map<std::string, std::string> &Taskbar::fg_process_map() const {
+  return fg_process_map_;
 }
 
 } /* namespace waybar::modules::wlr */

@@ -160,6 +160,7 @@ class Taskbar : public waybar::AModule, public hyprland::EventHandler {
   IconLoader icon_loader_;
   std::unordered_set<std::string> ignore_list_;
   std::map<std::string, std::string> app_ids_replace_map_;
+  std::map<std::string, std::string> fg_process_map_;
 
   struct zwlr_foreign_toplevel_manager_v1 *manager_;
   struct wl_seat *seat_;
@@ -206,6 +207,7 @@ class Taskbar : public waybar::AModule, public hyprland::EventHandler {
   const IconLoader &icon_loader() const;
   const std::unordered_set<std::string> &ignore_list() const;
   const std::map<std::string, std::string> &app_ids_replace_map() const;
+  const std::map<std::string, std::string> &fg_process_map() const;
 };
 
 } /* namespace waybar::modules::wlr */
