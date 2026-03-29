@@ -58,7 +58,10 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
     {
         std::string fd_dir = "/proc/" + std::to_string(terminal_pid) + "/fd";
         DIR *d = opendir(fd_dir.c_str());
-        if (!d) return "";
+        if (!d) {
+            spdlog::warn("fgicon: cannot open {}", fd_dir);
+            return "";
+        }
         struct dirent *ent;
         while ((ent = readdir(d)) != nullptr) {
             char link_buf[256] = {};
@@ -71,14 +74,25 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
         }
         closedir(d);
     }
-    if (pts_path.empty()) return "";
+    if (pts_path.empty()) {
+        spdlog::warn("fgicon: no pts device found for pid {}", terminal_pid);
+        return "";
+    }
+    spdlog::warn("fgicon: pid {} pts device is {}", terminal_pid, pts_path);
 
     // Step 2: get the foreground process group of that PTY
     int pts_fd = open(pts_path.c_str(), O_WRONLY | O_NOCTTY);
-    if (pts_fd < 0) return "";
+    if (pts_fd < 0) {
+        spdlog::warn("fgicon: cannot open {} (errno {})", pts_path, errno);
+        return "";
+    }
     pid_t fg_pgrp = tcgetpgrp(pts_fd);
     close(pts_fd);
-    if (fg_pgrp <= 0) return "";
+    if (fg_pgrp <= 0) {
+        spdlog::warn("fgicon: tcgetpgrp failed on {} (errno {})", pts_path, errno);
+        return "";
+    }
+    spdlog::warn("fgicon: fg process group is {}", fg_pgrp);
 
     // Step 3: scan /proc for the first non-shell process in the foreground group
     DIR *proc_dir = opendir("/proc");
@@ -106,6 +120,10 @@ static std::string getForegroundProcessName(pid_t terminal_pid) {
         }
     }
     closedir(proc_dir);
+    if (result.empty())
+        spdlog::warn("fgicon: no non-shell process found in group {}", fg_pgrp);
+    else
+        spdlog::warn("fgicon: fg process name is '{}'", result);
     return result;
 }
 // Search all installed .desktop files for one whose Exec= basename matches
@@ -391,19 +409,31 @@ void Task::handle_app_id(const char *app_id) {
 // Multiplexers (tmux, zellij, …) are returned as-is so their own icon is shown.
 // Returns true and updates icon_/app_info_/name_ on success.
 bool Task::tryUpdateIconFromTerminalFg() {
-  if (!with_icon_ && !with_name_) return false;
+  spdlog::warn("fgicon: tryUpdateIconFromTerminalFg called for app_id='{}' title='{}'", app_id_, title_);
+  if (!with_icon_ && !with_name_) {
+    spdlog::warn("fgicon: skipping — with_icon_={} with_name_={}", with_icon_, with_name_);
+    return false;
+  }
   const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
-  if (his == nullptr) return false;
+  if (his == nullptr) {
+    spdlog::warn("fgicon: HYPRLAND_INSTANCE_SIGNATURE not set");
+    return false;
+  }
   // Lazily initialize IPC if it hasn't been set up yet (e.g. when
   // sort-by-hyprland-workspaces is not enabled in the config).
   if (!hyprland::gIPC) {
+    spdlog::warn("fgicon: gIPC is null, initializing");
     hyprland::modulesReady = true;
     hyprland::gIPC = std::make_unique<hyprland::IPC>();
   }
 
   try {
     Json::Value clients = hyprland::gIPC->getSocket1JsonReply("clients");
-    if (!clients.isArray()) return false;
+    if (!clients.isArray()) {
+      spdlog::warn("fgicon: clients IPC reply is not an array");
+      return false;
+    }
+    spdlog::warn("fgicon: got {} clients from IPC", clients.size());
 
     // Match this task to a Hyprland client by class + title to get its PID.
     // Fall back to class-only if no exact title match exists — the title seen
@@ -412,6 +442,8 @@ bool Task::tryUpdateIconFromTerminalFg() {
     pid_t class_only_pid = -1;
     for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
       const auto &client = clients[i];
+      spdlog::warn("fgicon: client[{}] class='{}' title='{}'", i,
+                   client["class"].asString(), client["title"].asString());
       if (client["class"].asString() == app_id_) {
         if (client["title"].asString() == title_) {
           term_pid = static_cast<pid_t>(client["pid"].asInt());
@@ -422,12 +454,16 @@ bool Task::tryUpdateIconFromTerminalFg() {
       }
     }
     if (term_pid <= 0) term_pid = class_only_pid;
-    if (term_pid <= 0) return false;
+    if (term_pid <= 0) {
+      spdlog::warn("fgicon: no matching client found for app_id='{}'", app_id_);
+      return false;
+    }
+    spdlog::warn("fgicon: matched pid={}", term_pid);
 
     std::string fg_name = getForegroundProcessName(term_pid);
     if (fg_name.empty()) return false;
 
-    spdlog::debug("Task ({}): terminal {} fg process is '{}'", id_, app_id_, fg_name);
+    spdlog::warn("fgicon: terminal {} fg process is '{}'", app_id_, fg_name);
 
     int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
 
@@ -458,8 +494,9 @@ bool Task::tryUpdateIconFromTerminalFg() {
         return true;
       }
     }
+    spdlog::warn("fgicon: no desktop entry or icon found for '{}'", fg_name);
   } catch (const std::exception &e) {
-    spdlog::debug("Task ({}): tryUpdateIconFromTerminalFg failed: {}", id_, e.what());
+    spdlog::warn("fgicon: exception: {}", e.what());
   }
   return false;
 }
