@@ -1029,14 +1029,32 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
   setupControlSocket();
 
   // Reload all task icons whenever the GTK icon theme signals a change.
-  // This handles cases like Satty (screencopy portal) triggering a theme
-  // invalidation that stales native-backed Cairo surfaces on all icons.
   Gtk::IconTheme::get_default()->signal_changed().connect(
       sigc::mem_fun(*this, &Taskbar::notifyIconThemeChanged));
   for (auto &custom_theme : icon_loader_.custom_themes()) {
     custom_theme->signal_changed().connect(
         sigc::mem_fun(*this, &Taskbar::notifyIconThemeChanged));
   }
+
+  // Reload icons when the taskbar container is re-realized. This fires when
+  // Waybar's own layer-shell surface is destroyed and recreated (e.g. when a
+  // fullscreen screencopy tool like Satty briefly unmaps the bar layer). Cairo
+  // surfaces created with image.get_window() become stale for the new window.
+  box_.signal_realize().connect([this]() {
+    spdlog::warn("Taskbar: box_ realized — reloading all task icons");
+    for (auto &t : tasks_) {
+      t->reload_icon();
+    }
+    dp.emit();
+  });
+
+  // Diagnostic: log when the bar surface is mapped/unmapped.
+  box_.signal_map().connect([this]() {
+    spdlog::warn("Taskbar: box_ mapped");
+  });
+  box_.signal_unmap().connect([]() {
+    spdlog::warn("Taskbar: box_ unmapped");
+  });
 }
 
 Taskbar::~Taskbar() {
