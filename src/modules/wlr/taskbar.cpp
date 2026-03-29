@@ -53,34 +53,59 @@ static const std::unordered_set<std::string> KNOWN_SHELLS = {
 // Returns the multiplexer name (e.g. "tmux") when one is running so its own
 // icon is used. Returns the app name (e.g. "yazi") for everything else.
 static std::string getForegroundProcessName(pid_t terminal_pid) {
-    // Step 1: find the PTY slave (/dev/pts/N) opened by this terminal
+    // Terminal emulators hold the PTY master (/dev/ptmx), not the slave.
+    // The PTY slave (/dev/pts/N) is held by the child shell process.
+    // Step 1: scan /proc for direct children of terminal_pid and find the
+    // one that has a /dev/pts/N fd — that is the shell kitty/foot/etc spawned.
     std::string pts_path;
     {
-        std::string fd_dir = "/proc/" + std::to_string(terminal_pid) + "/fd";
-        DIR *d = opendir(fd_dir.c_str());
-        if (!d) {
-            spdlog::warn("fgicon: cannot open {}", fd_dir);
+        DIR *proc_dir = opendir("/proc");
+        if (!proc_dir) {
+            spdlog::warn("fgicon: cannot open /proc");
             return "";
         }
-        struct dirent *ent;
-        while ((ent = readdir(d)) != nullptr) {
-            char link_buf[256] = {};
-            std::string fd_path = fd_dir + "/" + ent->d_name;
-            if (readlink(fd_path.c_str(), link_buf, sizeof(link_buf) - 1) > 0 &&
-                strncmp(link_buf, "/dev/pts/", 9) == 0) {
-                pts_path = link_buf;
-                break;
+        struct dirent *pent;
+        while ((pent = readdir(proc_dir)) != nullptr && pts_path.empty()) {
+            bool is_numeric = true;
+            for (const char *c = pent->d_name; *c; ++c) {
+                if (!isdigit(static_cast<unsigned char>(*c))) { is_numeric = false; break; }
             }
+            if (!is_numeric) continue;
+
+            std::string stat_path = "/proc/" + std::string(pent->d_name) + "/stat";
+            FILE *f = fopen(stat_path.c_str(), "r");
+            if (!f) continue;
+            int pid_val, ppid, pgrp;
+            char comm[256], state;
+            int ret = fscanf(f, "%d (%255[^)]) %c %d %d", &pid_val, comm, &state, &ppid, &pgrp);
+            fclose(f);
+            if (ret < 5 || ppid != static_cast<int>(terminal_pid)) continue;
+
+            // This process is a direct child of the terminal — look for pts slave
+            std::string fd_dir = "/proc/" + std::string(pent->d_name) + "/fd";
+            DIR *d = opendir(fd_dir.c_str());
+            if (!d) continue;
+            struct dirent *ent;
+            while ((ent = readdir(d)) != nullptr) {
+                char link_buf[256] = {};
+                std::string fd_path = fd_dir + "/" + ent->d_name;
+                if (readlink(fd_path.c_str(), link_buf, sizeof(link_buf) - 1) > 0 &&
+                    strncmp(link_buf, "/dev/pts/", 9) == 0) {
+                    pts_path = link_buf;
+                    break;
+                }
+            }
+            closedir(d);
         }
-        closedir(d);
+        closedir(proc_dir);
     }
     if (pts_path.empty()) {
-        spdlog::warn("fgicon: no pts device found for pid {}", terminal_pid);
+        spdlog::warn("fgicon: no pts device found in children of pid {}", terminal_pid);
         return "";
     }
-    spdlog::warn("fgicon: pid {} pts device is {}", terminal_pid, pts_path);
+    spdlog::warn("fgicon: pid {} child pts device is {}", terminal_pid, pts_path);
 
-    // Step 2: get the foreground process group of that PTY
+    // Step 2: get the foreground process group of that PTY slave
     int pts_fd = open(pts_path.c_str(), O_WRONLY | O_NOCTTY);
     if (pts_fd < 0) {
         spdlog::warn("fgicon: cannot open {} (errno {})", pts_path, errno);
