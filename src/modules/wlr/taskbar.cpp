@@ -877,9 +877,10 @@ void Task::minimize(bool set) {
 // Re-run icon loading using software surfaces so icons survive any GTK
 // window/style reset (e.g. screencopy tools causing surface invalidation).
 void Task::reload_icon() {
-  if (!with_icon_) return;
+  if (!with_icon_ || !tbar_) return;
   int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
   const auto &loader = tbar_->icon_loader();
+  icon_.clear();  // release previous surface reference before loading new one
   if (app_info_) {
     if (load_icon_software(icon_, app_info_, loader, icon_size))
       icon_.show();
@@ -1141,6 +1142,13 @@ Taskbar::~Taskbar() {
 }
 
 void Taskbar::update() {
+  if (icon_theme_dirty_.exchange(false, std::memory_order_relaxed)) {
+    spdlog::debug("Taskbar: reloading all task icons (deferred from theme change)");
+    for (auto &t : tasks_) {
+      t->reload_icon();
+    }
+  }
+
   for (auto &t : tasks_) {
     t->update();
   }
@@ -1431,11 +1439,9 @@ void Taskbar::updateSelection(int old_index) {
 }
 
 void Taskbar::notifyIconThemeChanged() {
-  spdlog::debug("Taskbar: icon theme signal_changed fired, reloading all task icons");
-  for (auto &t : tasks_) {
-    t->reload_icon();
-  }
-  dp.emit();
+  spdlog::debug("Taskbar: icon theme signal_changed fired — deferring icon reload");
+  icon_theme_dirty_.store(true, std::memory_order_relaxed);
+  dp.emit();  // wake the dispatcher; reload happens in update()
 }
 
 void Taskbar::notifyActiveChanged(uint32_t new_active_id) {

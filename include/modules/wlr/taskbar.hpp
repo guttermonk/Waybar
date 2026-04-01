@@ -175,6 +175,7 @@ class Taskbar : public waybar::AModule, public hyprland::EventHandler {
   std::string socket_path_;
   std::thread socket_thread_;
   std::atomic<bool> socket_running_{false};
+  std::atomic<bool> icon_theme_dirty_{false};
 
   void setupControlSocket();
   void cleanupControlSocket();
