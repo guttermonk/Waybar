@@ -1,7 +1,6 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
-#include <hyprland/src/event/EventBus.hpp>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -9,14 +8,15 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 
 inline HANDLE PHANDLE = nullptr;
 
 // Track if we're in switcher mode (Alt+Tab was pressed)
 static bool g_switcherActive = false;
 
-// Event listener handle - must be kept alive to receive events
-static CHyprSignalListener g_pKeyPressListener;
+// Hook callback handle - must be kept alive to receive events
+static SP<HOOK_CALLBACK_FN> g_pKeyPressCallback;
 
 static void sendToTaskbarSocket(const char* command) {
     const char* waylandDisplay = getenv("WAYLAND_DISPLAY");
@@ -44,21 +44,28 @@ static void sendToTaskbarSocket(const char* command) {
     close(sockfd);
 }
 
-static void onKeyPress(const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
-    // Find an active, non-virtual keyboard from the list
-    SP<IKeyboard> keyboard = nullptr;
-    for (const auto& kb : g_pInputManager->m_keyboards) {
-        if (kb && kb->m_active && !g_pInputManager->shouldIgnoreVirtualKeyboard(kb)) {
-            keyboard = kb;
-            break;
-        }
-    }
-    
-    if (!keyboard) {
+static void onKeyPress(void* self, SCallbackInfo& info, std::any data) {
+    // Extract keyboard and event from the hook data
+    auto* const PDATA = std::any_cast<std::unordered_map<std::string, std::any>>(&data);
+    if (!PDATA)
         return;
-    }
+    
+    auto eventIt = PDATA->find("event");
+    auto keyboardIt = PDATA->find("keyboard");
+    
+    if (eventIt == PDATA->end() || keyboardIt == PDATA->end())
+        return;
+    
+    const auto event = std::any_cast<IKeyboard::SKeyEvent>(eventIt->second);
+    const auto keyboard = std::any_cast<SP<IKeyboard>>(keyboardIt->second);
+    
+    if (!keyboard)
+        return;
     
     const auto state = keyboard->m_xkbState;
+    if (!state)
+        return;
+    
     const uint32_t keycode = event.keycode + 8; // xkbcommon expects +8 from libinput
     const bool released = event.state == WL_KEYBOARD_KEY_STATE_RELEASED;
     const xkb_keysym_t keysym = xkb_state_key_get_one_sym(state, keycode);
@@ -98,10 +105,12 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
     
-    // Register for keyboard key events using the modern Event bus API
-    g_pKeyPressListener = Event::bus()->m_events.input.keyboard.key.listen(
-        [](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
-            onKeyPress(event, info);
+    // Register for keyboard key events using the hook system API (Hyprland 0.52.x compatible)
+    g_pKeyPressCallback = HyprlandAPI::registerCallbackDynamic(
+        PHANDLE,
+        "keyPress",
+        [](void* self, SCallbackInfo& info, std::any data) {
+            onKeyPress(self, info, data);
         }
     );
     
@@ -109,6 +118,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    // Reset the listener to unregister
-    g_pKeyPressListener.reset();
+    // Reset the callback pointer to unregister
+    g_pKeyPressCallback.reset();
 }
