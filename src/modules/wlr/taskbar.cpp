@@ -200,10 +200,15 @@ static bool load_icon_software(Gtk::Image &image,
 
     // Determine icon name: try startup WM class in each custom theme first,
     // then fall back to the icon declared in the desktop entry.
+    //
+    // The WM-class probe must only accept an icon the custom theme itself ships.
+    // lookup_icon() follows the theme's Inherits= chain, so an unguarded probe
+    // succeeds through a parent theme and quietly discards the entry's Icon=,
+    // which is the icon the custom theme was most likely chosen to provide.
     std::string icon_name;
     std::string wm_class = app_info->get_startup_wm_class();
-    for (const auto &theme : loader.custom_themes()) {
-        if (!wm_class.empty() && theme->lookup_icon(wm_class, scaled_size)) {
+    for (const auto &[theme_name, theme] : loader.custom_themes()) {
+        if (IconLoader::icon_is_native_to_theme(theme, theme_name, wm_class, scaled_size)) {
             icon_name = wm_class;
             break;
         }
@@ -215,7 +220,7 @@ static bool load_icon_software(Gtk::Image &image,
 
     // Load pixbuf: custom themes first, then system default (includes hicolor).
     Glib::RefPtr<Gdk::Pixbuf> pixbuf;
-    for (const auto &theme : loader.custom_themes()) {
+    for (const auto &[theme_name, theme] : loader.custom_themes()) {
         try {
             pixbuf = theme->load_icon(icon_name, scaled_size, Gtk::ICON_LOOKUP_FORCE_SIZE);
             if (pixbuf) break;
@@ -1092,7 +1097,7 @@ Taskbar::Taskbar(const std::string &id, const waybar::Bar &bar, const Json::Valu
   // Reload all task icons whenever the GTK icon theme signals a change.
   Gtk::IconTheme::get_default()->signal_changed().connect(
       sigc::mem_fun(*this, &Taskbar::notifyIconThemeChanged));
-  for (auto &custom_theme : icon_loader_.custom_themes()) {
+  for (const auto &[custom_theme_name, custom_theme] : icon_loader_.custom_themes()) {
     custom_theme->signal_changed().connect(
         sigc::mem_fun(*this, &Taskbar::notifyIconThemeChanged));
   }
