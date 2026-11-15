@@ -1,6 +1,7 @@
 #pragma once
 
 #include <gdk/gdk.h>
+#include <glibmm/iochannel.h>
 #include <glibmm/refptr.h>
 #include <gtkmm/box.h>
 #include <gtkmm/button.h>
@@ -9,10 +10,12 @@
 #include <gtkmm/label.h>
 #include <wayland-client.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <ranges>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -21,6 +24,9 @@
 #include "client.hpp"
 #include "ext-workspace-v1-client-protocol.h"
 #include "giomm/desktopappinfo.h"
+#ifdef HAVE_HYPRLAND
+#include "modules/hyprland/backend.hpp"
+#endif
 #include "util/icon_loader.hpp"
 #include "util/json.hpp"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
@@ -108,6 +114,7 @@ class Task {
   void lookup_app_info();
   void show_button();
   void hide_button();
+  bool tryUpdateIconFromTerminalFg();
 
  public:
   /* Getter functions */
@@ -148,6 +155,9 @@ class Task {
 
  public:
   void update();
+  /* Rasterize the icon again from the already-resolved desktop entry. Public so
+   * Taskbar can refresh every task at once when the icon theme changes. */
+  void reload_icon();
 
  public:
   /* Interaction with the tasks */
@@ -160,7 +170,16 @@ class Task {
 
 using TaskPtr = std::unique_ptr<Task>;
 
+/* The Hyprland-specific behaviour (workspace-aware sorting, activation via
+ * Hyprland's own dispatch, foreground-process icons) is only built when Waybar
+ * is built with Hyprland support. Upstream gates the whole modules/hyprland
+ * tree behind -DHAVE_HYPRLAND, so without this guard the taskbar fails to build
+ * anywhere that support is off -- including the FreeBSD CI job. */
+#ifdef HAVE_HYPRLAND
+class Taskbar : public waybar::AModule, public hyprland::EventHandler {
+#else
 class Taskbar : public waybar::AModule {
+#endif
  public:
   struct WorkspaceState {
     Taskbar* taskbar;
@@ -171,9 +190,19 @@ class Taskbar : public waybar::AModule {
   Taskbar(const std::string&, const waybar::Bar&, const Json::Value&);
   ~Taskbar();
   void update();
+#ifdef HAVE_HYPRLAND
+  void onEvent(const std::string& ev) override;
+#endif
 
   /* A redraw is queued on dp, which a burst of events must not flood */
   bool update_queued_ = false;
+
+  /* Set when the icon theme changed and every task icon needs rasterizing
+   * again. Deferred to update() rather than done in the signal handler: a theme
+   * change touches every task at once, and GTK emits the signal more than once
+   * per change. Plain bool, like update_queued_ above -- both are only ever
+   * touched on the main loop. */
+  bool icon_theme_dirty_ = false;
 
  private:
   const waybar::Bar& bar_;
@@ -184,6 +213,7 @@ class Taskbar : public waybar::AModule {
   std::unordered_set<std::string> ignore_list_;
   std::unordered_set<std::string> squash_list_;
   std::map<std::string, std::string> app_ids_replace_map_;
+  std::map<std::string, std::string> fg_process_map_;
 
   struct zwlr_foreign_toplevel_manager_v1* manager_;
   struct ext_workspace_manager_v1* workspace_manager_;
@@ -191,8 +221,34 @@ class Taskbar : public waybar::AModule {
   std::vector<struct ext_workspace_group_handle_v1*> workspace_groups_;
   std::vector<std::unique_ptr<WorkspaceState>> workspaces_;
   struct ext_workspace_handle_v1* current_workspace_ = nullptr;
+#ifdef HAVE_HYPRLAND
+  bool registered_for_hyprland_events_ = false;
+#endif
+
+  /* Keyboard navigation: a selection that the control socket moves through the
+   * task list, so the bar can act as the visible half of a window switcher.
+   * icon_theme_dirty_ lives up beside update_queued_ -- both are main-loop only. */
+  int selection_index_ = -1;
+  uint32_t current_active_id_ = 0;   // currently active window
+  uint32_t previous_active_id_ = 0;  // previous active window, for MRU switching
+  int socket_fd_ = -1;
+  std::string socket_path_;
+  std::thread socket_thread_;
+  std::atomic<bool> socket_running_{false};
+
+  void setupControlSocket();
+  void cleanupControlSocket();
+  void socketListener();
+  void handleCommand(const std::string& cmd);
+  void selectNext();
+  void selectPrev();
+  void activateSelected();
+  void clearSelection();
+  void updateSelection(int old_index);
 
  public:
+  void notifyActiveChanged(uint32_t new_active_id);
+  void notifyIconThemeChanged();
   /* Callbacks for global registration */
   void register_manager(struct wl_registry*, uint32_t name, uint32_t version);
   void register_workspace_manager(struct wl_registry*, uint32_t name, uint32_t version);
@@ -216,6 +272,7 @@ class Taskbar : public waybar::AModule {
   void remove_task(uint32_t);
   void assign_current_workspace(Task&);
   void update_bar_css_classes();
+  void notify_icon_theme_changed();
 
   bool show_output(struct wl_output*) const;
   bool all_outputs() const;
@@ -224,6 +281,7 @@ class Taskbar : public waybar::AModule {
   const std::unordered_set<std::string>& ignore_list() const;
   const std::unordered_set<std::string>& squash_list() const;
   const std::map<std::string, std::string>& app_ids_replace_map() const;
+  const std::map<std::string, std::string>& fg_process_map() const;
 
   auto tasks() {
     return tasks_ | std::views::transform([](auto& task) -> Task& { return *task; });

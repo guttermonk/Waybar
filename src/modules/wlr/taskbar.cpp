@@ -1,21 +1,32 @@
 #include "modules/wlr/taskbar.hpp"
 
+#include <dirent.h>
 #include <fmt/core.h>
 #include <gdkmm/monitor.h>
 #include <gio/gdesktopappinfo.h>
 #include <giomm/desktopappinfo.h>
 #include <gtkmm/icontheme.h>
+#include <poll.h>
 #include <spdlog/spdlog.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 #include "gdkmm/general.h"
+#ifdef HAVE_HYPRLAND
+#include "modules/hyprland/backend.hpp"
+#endif
 #include "glibmm/error.h"
 #include "glibmm/fileutils.h"
 #include "glibmm/refptr.h"
@@ -29,7 +40,214 @@
 namespace waybar::modules::wlr {
 
 /* Task class implementation */
-uint32_t Task::global_id = 0;
+
+static const std::unordered_set<std::string> KNOWN_TERMINALS = {
+    "kitty", "alacritty", "foot",    "wezterm", "wezterm-gui", "gnome-terminal", "xterm",
+    "urxvt", "st",        "konsole", "termite", "tilix",       "rxvt",           "mlterm"};
+
+static const std::unordered_set<std::string> KNOWN_SHELLS = {
+    "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "elvish"};
+
+// Case-insensitive terminal check — app_id values differ across compositors
+// (e.g. Hyprland reports "Alacritty" while the binary is "alacritty").
+static bool isKnownTerminal(const std::string& id) {
+  std::string lower = id;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return KNOWN_TERMINALS.count(lower) > 0;
+}
+
+// Walk /proc to find the foreground process name for the given terminal PID.
+// Returns "" when only a shell is in the foreground (fall back to terminal icon).
+// Returns the multiplexer name (e.g. "tmux") when one is running so its own
+// icon is used. Returns the app name (e.g. "yazi") for everything else.
+//
+// Uses only /proc/[pid]/stat — no tcgetpgrp, no ioctl, no permission issues.
+// stat field layout: pid (comm) state ppid pgrp session tty_nr tpgid ...
+//   tpgid (field 8) is the foreground process group of the controlling terminal.
+static std::string getForegroundProcessName(pid_t terminal_pid) {
+  // Processes to ignore when scanning children of the terminal.
+  // "kitten" is kitty's own internal helper, not a real application.
+  static const std::unordered_set<std::string> SKIP_PROCS = {"kitten"};
+
+  struct ProcInfo {
+    pid_t pid;
+    std::string comm;
+    pid_t ppid;
+    pid_t pgrp;
+    pid_t tpgid;  // foreground pgrp of the controlling terminal
+  };
+
+  // Single pass: read every /proc/[pid]/stat entry we can access.
+  std::vector<ProcInfo> all_procs;
+  {
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) return "";
+    struct dirent* pent;
+    while ((pent = readdir(proc_dir)) != nullptr) {
+      bool is_numeric = true;
+      for (const char* c = pent->d_name; *c; ++c) {
+        if (!isdigit(static_cast<unsigned char>(*c))) {
+          is_numeric = false;
+          break;
+        }
+      }
+      if (!is_numeric) continue;
+
+      std::string stat_path = "/proc/" + std::string(pent->d_name) + "/stat";
+      FILE* f = fopen(stat_path.c_str(), "r");
+      if (!f) continue;
+
+      ProcInfo info;
+      char comm_buf[256] = {};
+      int ppid = 0, pgrp = 0, session = 0, tty_nr = 0, tpgid = 0;
+      int ret = fscanf(f, "%d (%255[^)]) %*c %d %d %d %d %d", &info.pid, comm_buf, &ppid, &pgrp,
+                       &session, &tty_nr, &tpgid);
+      fclose(f);
+      if (ret < 7) continue;
+
+      info.comm = comm_buf;
+      info.ppid = static_cast<pid_t>(ppid);
+      info.pgrp = static_cast<pid_t>(pgrp);
+      info.tpgid = static_cast<pid_t>(tpgid);
+      all_procs.push_back(std::move(info));
+    }
+    closedir(proc_dir);
+  }
+
+  // Collect direct children of the terminal PID.
+  std::vector<const ProcInfo*> children;
+  for (const auto& p : all_procs) {
+    if (p.ppid == terminal_pid) children.push_back(&p);
+  }
+
+  if (children.empty()) {
+    spdlog::debug("fgicon: no children found for pid {}", terminal_pid);
+    return "";
+  }
+
+  for (const auto* child : children) {
+    spdlog::debug("fgicon: child pid={} comm='{}' pgrp={} tpgid={}", child->pid, child->comm,
+                  child->pgrp, child->tpgid);
+
+    // Skip the terminal's own helper processes and nested terminals.
+    if (SKIP_PROCS.count(child->comm) || isKnownTerminal(child->comm)) continue;
+
+    if (KNOWN_SHELLS.count(child->comm)) {
+      // The child is a shell. tpgid tells us what is in the foreground.
+      pid_t fg_pgrp = child->tpgid;
+      if (fg_pgrp <= 0 || fg_pgrp == child->pgrp) {
+        // Shell itself is in the foreground — nothing interesting running.
+        spdlog::debug("fgicon: shell '{}' is in foreground, skipping", child->comm);
+        continue;
+      }
+      // Find the process in the foreground group.
+      for (const auto& p : all_procs) {
+        if (p.pgrp == fg_pgrp && !KNOWN_SHELLS.count(p.comm)) {
+          spdlog::debug("fgicon: fg process is '{}' (pgrp {})", p.comm, fg_pgrp);
+          return p.comm;
+        }
+      }
+    } else {
+      // Non-shell direct child of the terminal (e.g. kitty running yazi directly).
+      spdlog::debug("fgicon: direct non-shell child is '{}'", child->comm);
+      return child->comm;
+    }
+  }
+
+  spdlog::debug("fgicon: no foreground app found for terminal pid {}", terminal_pid);
+  return "";
+}
+
+// Search all installed .desktop files for one whose Exec= basename matches
+// proc_name. Handles apps where the binary name differs from the desktop file
+// name, e.g. hx (helix) or vi (neovim).
+static Glib::RefPtr<Gio::DesktopAppInfo> findAppInfoByExec(const std::string& proc_name) {
+  // Build the exec→desktop map once. Calling Gio::AppInfo::get_all() on
+  // every title-change event emits a GIO "changed" signal that causes GTK
+  // to invalidate its icon theme cache, wiping all taskbar icons at once.
+  static std::unordered_map<std::string, Glib::RefPtr<Gio::DesktopAppInfo>> s_cache;
+  static bool s_built = false;
+  if (!s_built) {
+    s_built = true;
+    for (const auto& app : Gio::AppInfo::get_all()) {
+      auto desktop = Glib::RefPtr<Gio::DesktopAppInfo>::cast_dynamic(app);
+      if (!desktop) continue;
+      std::string exec = app->get_executable();
+      auto slash = exec.rfind('/');
+      if (slash != std::string::npos) exec = exec.substr(slash + 1);
+      if (s_cache.find(exec) == s_cache.end()) s_cache[exec] = desktop;
+    }
+  }
+  auto it = s_cache.find(proc_name);
+  return it != s_cache.end() ? it->second : Glib::RefPtr<Gio::DesktopAppInfo>{};
+}
+
+// Load an app icon as a software (window-independent) Cairo surface.
+//
+// The shared IconLoader::image_load_icon() passes image.get_window() to
+// gdk_cairo_surface_create_from_pixbuf(), which ties the surface to that
+// specific GdkWindow. When a screencopy tool (Satty, grim, etc.) causes GTK
+// to reset its style/surface state, those window-backed surfaces go stale
+// and every icon shows the broken-image symbol.
+//
+// This helper is intentionally scoped to the taskbar module. It mirrors the
+// IconLoader lookup logic but passes a null window so the resulting surface is
+// a plain software image that survives any window lifecycle event.
+static bool load_icon_software(Gtk::Image& image, const Glib::RefPtr<Gio::DesktopAppInfo>& app_info,
+                               const IconLoader& loader, int size) {
+  if (!app_info) return false;
+
+  int scaled_size = size * image.get_scale_factor();
+
+  // Determine icon name: try startup WM class in each custom theme first,
+  // then fall back to the icon declared in the desktop entry.
+  //
+  // The WM-class probe must only accept an icon the custom theme itself ships.
+  // lookup_icon() follows the theme's Inherits= chain, so an unguarded probe
+  // succeeds through a parent theme and quietly discards the entry's Icon=,
+  // which is the icon the custom theme was most likely chosen to provide.
+  std::string icon_name;
+  std::string wm_class = app_info->get_startup_wm_class();
+  for (const auto& [theme_name, theme] : loader.custom_themes()) {
+    if (IconLoader::icon_is_native_to_theme(theme, theme_name, wm_class, scaled_size)) {
+      icon_name = wm_class;
+      break;
+    }
+  }
+  if (icon_name.empty() && app_info->get_icon()) icon_name = app_info->get_icon()->to_string();
+  if (icon_name.empty()) icon_name = "unknown";
+
+  // Load pixbuf: custom themes first, then system default (includes hicolor).
+  Glib::RefPtr<Gdk::Pixbuf> pixbuf;
+  for (const auto& [theme_name, theme] : loader.custom_themes()) {
+    try {
+      pixbuf = theme->load_icon(icon_name, scaled_size, Gtk::ICON_LOOKUP_FORCE_SIZE);
+      if (pixbuf) break;
+    } catch (...) {
+    }
+  }
+  if (!pixbuf) {
+    try {
+      pixbuf = Gtk::IconTheme::get_default()->load_icon(icon_name, scaled_size,
+                                                        Gtk::ICON_LOOKUP_FORCE_SIZE);
+    } catch (...) {
+    }
+  }
+  if (!pixbuf) return false;
+
+  if (pixbuf->get_width() != scaled_size) {
+    int w = scaled_size * pixbuf->get_width() / pixbuf->get_height();
+    pixbuf = pixbuf->scale_simple(w, scaled_size, Gdk::InterpType::INTERP_BILINEAR);
+  }
+
+  // Null window → CAIRO_SURFACE_TYPE_IMAGE (software), never goes stale.
+  auto surface = Gdk::Cairo::create_surface_from_pixbuf(pixbuf, image.get_scale_factor(), {});
+  image.set(surface);
+  return true;
+}
+
+uint32_t Task::global_id = 1;  // Start from 1 so 0 can be used as "no window" sentinel
 
 static void tl_handle_title(void* data, struct zwlr_foreign_toplevel_handle_v1* handle,
                             const char* title) {
@@ -182,7 +400,10 @@ Task::Task(const waybar::Bar& bar, const Json::Value& config, Taskbar* tbar,
     if (config_["tooltip-format"].isString())
       format_tooltip_ = config_["tooltip-format"].asString();
     else
-      format_tooltip_ = "{title}";
+      // Default to {name} so fg process display names show in tooltips.
+      // Users can override with tooltip-format: "{title}" to get the raw
+      // window title back.
+      format_tooltip_ = "{name}";
   }
 
   /* Handle click events if configured */
@@ -206,10 +427,8 @@ Task::Task(const waybar::Bar& bar, const Json::Value& config, Taskbar* tbar,
   /* Re-rasterize the icon if the bar ends up on an output with a different scale
    * than the one GTK guessed while the widget was not yet realized. */
   icon_.property_scale_factor().signal_changed().connect([this] {
-    if (!with_icon_) return;
-    int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
     spdlog::debug("Task ({}) scale factor changed, reloading icon", id_);
-    if (tbar_->icon_loader().image_load_icon(icon_, app_info_, icon_size)) icon_.show();
+    reload_icon();
   });
 }
 
@@ -259,6 +478,8 @@ void Task::handle_title(const char* title) {
   hide_if_duplicate();
   update_duplicates();
 
+  // Only marks the lookup pending; lookup_app_info() does the work once per
+  // batch, including re-resolving a terminal's foreground program.
   if (with_icon_ || with_name_) {
     title_lookup_pending_ = true;
   }
@@ -343,10 +564,16 @@ void Task::handle_app_id(const char* app_id) {
 // title change: they run from update(), once per batch of events, and never twice for one string
 void Task::lookup_app_info() {
   bool looked_up = false;
+  // A terminal gets its icon from whatever program is in its foreground, which
+  // the cache below cannot speak for: the terminal's own desktop entry is
+  // already resolved, so neither branch would look anything up, yet the answer
+  // changes every time the title does. Track that separately.
+  bool recheck_terminal_fg = false;
   if (app_id_lookup_pending_) {
     app_id_lookup_pending_ = false;
     lookup_source_ = app_id_;
     looked_up = true;
+    recheck_terminal_fg = true;
     app_info_ = IconLoader::get_app_info_from_app_id_list(app_id_);
     if (app_info_) {
       name_ = app_info_->get_display_name();
@@ -354,12 +581,21 @@ void Task::lookup_app_info() {
   }
   if (title_lookup_pending_) {
     title_lookup_pending_ = false;
+    recheck_terminal_fg = true;
     if (!app_info_ && title_ != lookup_source_) {
       lookup_source_ = title_;
       looked_up = true;
       app_info_ = IconLoader::get_app_info_from_app_id_list(title_);
       name_ = app_info_ ? app_info_->get_display_name() : title_;
     }
+  }
+
+  // Runs once per batch of events like the lookups above, rather than inside
+  // the Wayland handlers: this costs a Hyprland IPC round trip and a walk of
+  // /proc, and a terminal rewriting its title on every prompt would otherwise
+  // starve the main loop -- the same failure the lookup batching fixed.
+  if (recheck_terminal_fg && isKnownTerminal(app_id_) && tryUpdateIconFromTerminalFg()) {
+    return;  // the helper set icon_, app_info_ and name_ itself
   }
 
   if (!looked_up || !with_icon_) {
@@ -371,6 +607,115 @@ void Task::lookup_app_info() {
     icon_.show();
   else
     spdlog::debug("Couldn't find icon for {}", lookup_source_);
+}
+
+// Query Hyprland IPC for the PID of the window matching this task, then walk
+// /proc to find what is running in the terminal's foreground.
+// Multiplexers (tmux, zellij, …) are returned as-is so their own icon is shown.
+// Returns true and updates icon_/app_info_/name_ on success.
+bool Task::tryUpdateIconFromTerminalFg() {
+#ifndef HAVE_HYPRLAND
+  // The PID of the window behind a task is only reachable through Hyprland's
+  // IPC here, so without Hyprland support there is nothing to resolve and the
+  // caller keeps the icon the desktop entry gave it.
+  return false;
+#else
+  spdlog::debug("fgicon: tryUpdateIconFromTerminalFg called for app_id='{}' title='{}'", app_id_,
+                title_);
+  if (!with_icon_ && !with_name_) {
+    spdlog::debug("fgicon: skipping — with_icon_={} with_name_={}", with_icon_, with_name_);
+    return false;
+  }
+  const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+  if (his == nullptr) {
+    spdlog::debug("fgicon: HYPRLAND_INSTANCE_SIGNATURE not set");
+    return false;
+  }
+  // IPC::inst() constructs the connection on first use, so there is nothing to
+  // initialize here even when sort-by-hyprland-workspaces is off.
+  try {
+    Json::Value clients = hyprland::IPC::inst().getSocket1JsonReply("clients");
+    if (!clients.isArray()) {
+      spdlog::debug("fgicon: clients IPC reply is not an array");
+      return false;
+    }
+    spdlog::debug("fgicon: got {} clients from IPC", clients.size());
+
+    // Match this task to a Hyprland client by class + title to get its PID.
+    // Fall back to class-only if no exact title match exists — the title seen
+    // by the wlr protocol and by Hyprland IPC can diverge slightly in timing.
+    pid_t term_pid = -1;
+    pid_t class_only_pid = -1;
+    for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
+      const auto& client = clients[i];
+      spdlog::debug("fgicon: client[{}] class='{}' title='{}'", i, client["class"].asString(),
+                    client["title"].asString());
+      if (client["class"].asString() == app_id_) {
+        if (client["title"].asString() == title_) {
+          term_pid = static_cast<pid_t>(client["pid"].asInt());
+          break;
+        } else if (class_only_pid < 0) {
+          class_only_pid = static_cast<pid_t>(client["pid"].asInt());
+        }
+      }
+    }
+    if (term_pid <= 0) term_pid = class_only_pid;
+    if (term_pid <= 0) {
+      spdlog::debug("fgicon: no matching client found for app_id='{}'", app_id_);
+      return false;
+    }
+    spdlog::debug("fgicon: matched pid={}", term_pid);
+
+    std::string fg_name = getForegroundProcessName(term_pid);
+    if (fg_name.empty()) return false;
+
+    // Apply fg-process-mapping: lets users remap wrapper scripts or processes
+    // with no .desktop file to a known app-id.
+    // e.g. "fg-process-mapping": { "zide": "zellij", "zellij": "zellij" }
+    const auto& fg_map = tbar_->fg_process_map();
+    auto fg_map_it = fg_map.find(fg_name);
+    if (fg_map_it != fg_map.end()) {
+      spdlog::debug("fgicon: remapping '{}' → '{}' via fg-process-mapping", fg_name,
+                    fg_map_it->second);
+      fg_name = fg_map_it->second;
+    }
+
+    spdlog::debug("fgicon: terminal {} fg process is '{}'", app_id_, fg_name);
+
+    int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
+
+    // Try to resolve a .desktop entry for the foreground process.
+    // First attempt: match by app-id (looks for <fg_name>.desktop).
+    // Second attempt: scan all desktop files for one whose Exec= basename
+    //   matches the process name — catches cases like hx → Helix.desktop.
+    auto fg_info = IconLoader::get_app_info_from_app_id_list(fg_name);
+    if (!fg_info) fg_info = findAppInfoByExec(fg_name);
+    if (fg_info) {
+      app_info_ = fg_info;
+      name_ = fg_info->get_display_name();
+      if (with_icon_) {
+        if (load_icon_software(icon_, app_info_, tbar_->icon_loader(), icon_size)) icon_.show();
+      }
+      return true;
+    }
+
+    // No .desktop entry — try the process name directly as an icon name
+    if (with_icon_) {
+      auto icon_theme = Gtk::IconTheme::get_default();
+      if (icon_theme->has_icon(fg_name)) {
+        icon_.set_from_icon_name(fg_name, Gtk::ICON_SIZE_INVALID);
+        icon_.set_pixel_size(icon_size);
+        icon_.show();
+        name_ = fg_name;
+        return true;
+      }
+    }
+    spdlog::debug("fgicon: no desktop entry or icon found for '{}'", fg_name);
+  } catch (const std::exception& e) {
+    spdlog::debug("fgicon: exception: {}", e.what());
+  }
+  return false;
+#endif  // HAVE_HYPRLAND
 }
 
 void Task::on_button_size_allocated(Gtk::Allocation& alloc) {
@@ -475,6 +820,9 @@ void Task::handle_done() {
 
   if (state_ & ACTIVE) {
     button.get_style_context()->add_class("active");
+    spdlog::info("Task::handle_done: window became active - id={}, app_id={}, title={}", id_,
+                 app_id_, title_);
+    tbar_->notifyActiveChanged(id_);
   } else if (!(state_ & ACTIVE)) {
     button.get_style_context()->remove_class("active");
   }
@@ -678,7 +1026,135 @@ void Task::minimize(bool set) {
     zwlr_foreign_toplevel_handle_v1_unset_minimized(handle_);
 }
 
-void Task::activate() { zwlr_foreign_toplevel_handle_v1_activate(handle_, seat_); }
+/* Rasterize the icon again from the entry this task already resolved. The
+ * pixbuf is produced once and then owned by the Gtk::Image, so anything that
+ * invalidates it -- a scale change, the icon theme changing, or the bar's
+ * layer-shell surface being recreated -- needs an explicit reload or the task
+ * keeps showing the stale image.
+ *
+ * Loads through load_icon_software() rather than IconLoader, so the surface is
+ * window-independent and survives the GTK window/style resets that screencopy
+ * tools trigger. Upstream's reload (PR #5493) uses the plain IconLoader path;
+ * this is the fork's stronger version. */
+void Task::reload_icon() {
+  if (!with_icon_ || !tbar_) return;
+  int icon_size = config_["icon-size"].isInt() ? config_["icon-size"].asInt() : 16;
+  const auto& loader = tbar_->icon_loader();
+  icon_.clear();  // release previous surface reference before loading new one
+  if (app_info_) {
+    if (load_icon_software(icon_, app_info_, loader, icon_size)) icon_.show();
+  } else {
+    auto fallback = IconLoader::get_app_info_from_app_id_list(app_id_);
+    if (fallback && load_icon_software(icon_, fallback, loader, icon_size)) icon_.show();
+  }
+}
+
+void Task::activate() {
+  // When running under Hyprland, use its own focuswindow dispatch rather than
+  // the wlr foreign-toplevel activate call. The wlr path causes Hyprland to
+  // warp the cursor to the centre of the screen on workspace switches; the
+  // dispatch path uses the same code as keyboard shortcuts and leaves the
+  // cursor where it is.
+#ifdef HAVE_HYPRLAND
+  if (std::getenv("HYPRLAND_INSTANCE_SIGNATURE") != nullptr) {
+    try {
+      Json::Value clients = hyprland::IPC::inst().getSocket1JsonReply("clients");
+      if (clients.isArray()) {
+        // Try exact class+title match first, then fall back to class only.
+        std::string addr;
+        std::string class_only_addr;
+        Json::Value matched_client;
+        Json::Value class_only_client;
+        for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
+          const auto& c = clients[i];
+          spdlog::debug("activate: checking client class='{}' title='{}' addr='{}'",
+                        c["class"].asString(), c["title"].asString(), c["address"].asString());
+          if (c["class"].asString() == app_id_) {
+            if (c["title"].asString() == title_) {
+              addr = c["address"].asString();
+              matched_client = c;
+              break;
+            } else if (class_only_addr.empty()) {
+              class_only_addr = c["address"].asString();
+              class_only_client = c;
+            }
+          }
+        }
+        if (addr.empty()) {
+          addr = class_only_addr;
+          matched_client = class_only_client;
+        }
+        if (!addr.empty()) {
+          int win_ws = matched_client["workspace"]["id"].asInt();
+          // Special workspaces carry negative ids, and `dispatch workspace -99`
+          // is read as a relative offset (99 workspaces back) rather than a
+          // target, so it lands on an ordinary workspace instead. Skip the
+          // workspace dispatch for those and let focuswindow below handle it: it
+          // pulls the special workspace up on the window's own monitor, which is
+          // not a workspace crossing, so there is no cursor warp to avoid here.
+          if (win_ws >= 0) {
+            // A special workspace is an overlay on top of the monitor's ordinary
+            // workspace, and neither `dispatch workspace N` nor focuswindow
+            // dismisses it, so the window we are activating would stay buried
+            // under it. Close it first. Only the focused monitor is considered:
+            // togglespecialworkspace acts on that monitor, so aiming it at a
+            // special workspace open elsewhere would open a second copy here
+            // instead of closing that one.
+            try {
+              Json::Value monitors = hyprland::IPC::inst().getSocket1JsonReply("monitors");
+              for (Json::ArrayIndex i = 0; monitors.isArray() && i < monitors.size(); ++i) {
+                if (!monitors[i]["focused"].asBool()) continue;
+                std::string special = monitors[i]["specialWorkspace"]["name"].asString();
+                if (special.empty()) break;
+                // The dispatcher wants the bare name: "special:magic" -> "magic",
+                // and the unnamed default reports itself as "special:special".
+                const auto colon = special.find(':');
+                if (colon != std::string::npos) special = special.substr(colon + 1);
+                spdlog::debug("activate: closing special workspace '{}'", special);
+                hyprland::IPC::getSocket1Reply("dispatch togglespecialworkspace " + special);
+                break;
+              }
+            } catch (...) {
+            }
+
+            try {
+              Json::Value activeWs = hyprland::IPC::inst().getSocket1JsonReply("activeworkspace");
+              int cur_ws = activeWs["id"].asInt();
+              if (win_ws != cur_ws) {
+                // Different workspace: use only `dispatch workspace N` — this
+                // mirrors what keyboard shortcuts do and respects
+                // cursor.warp_on_change_workspace. `focuswindow` has its own
+                // unconditional cursor warp when crossing workspaces that no
+                // setting can suppress without cursor.no_warps = true.
+                spdlog::debug("activate: switching workspace {} → {} (workspace-only dispatch)",
+                              cur_ws, win_ws);
+                hyprland::IPC::getSocket1Reply("dispatch workspace " + std::to_string(win_ws));
+                return;
+              }
+            } catch (...) {
+            }
+          }
+
+          // Same workspace, or a special workspace: focus the specific window.
+          std::string cmd = "dispatch focuswindow address:" + addr;
+          spdlog::debug("activate: dispatching '{}' for app_id='{}' title='{}'", cmd, app_id_,
+                        title_);
+          std::string reply = hyprland::IPC::getSocket1Reply(cmd);
+          spdlog::debug("activate: reply='{}'", reply);
+          return;
+        }
+        spdlog::debug("activate: no address found for app_id='{}' title='{}', falling back to wlr",
+                      app_id_, title_);
+      }
+    } catch (const std::exception& e) {
+      spdlog::warn("Task::activate: Hyprland dispatch failed: {}", e.what());
+    }
+  }
+#endif  // HAVE_HYPRLAND
+  // Fallback for non-Hyprland compositors.
+  spdlog::debug("activate: using wlr protocol for app_id='{}' title='{}'", app_id_, title_);
+  zwlr_foreign_toplevel_handle_v1_activate(handle_, seat_);
+}
 
 void Task::fullscreen(bool set) {
   if (zwlr_foreign_toplevel_handle_v1_get_version(handle_) <
@@ -799,12 +1275,80 @@ Taskbar::Taskbar(const std::string& id, const waybar::Bar& bar, const Json::Valu
     }
   }
 
+  // Load fg-process-mapping: maps a detected foreground process name to an
+  // app-id used for icon/name lookup. Useful for wrapper scripts (zide -> zellij)
+  // or apps with no .desktop file (zellij -> zellij icon name).
+  // Example config: "fg-process-mapping": { "zide": "zellij", "zellij": "zellij" }
+  if (config_["fg-process-mapping"].isObject()) {
+    const Json::Value& mapping = config_["fg-process-mapping"];
+    for (auto& key : config_["fg-process-mapping"].getMemberNames()) {
+      fg_process_map_.emplace(key, mapping[key].asString());
+    }
+  }
+
   for (auto& t : tasks_) {
     t->handle_app_id(t->app_id().c_str());
   }
+
+#ifdef HAVE_HYPRLAND
+  // IPC::inst() is a singleton that connects on first use, so the taskbar no
+  // longer has to stand one up before the foreground-icon lookup can run.
+
+  // Register for Hyprland events if sorting by Hyprland workspaces
+  if (config_["sort-by-hyprland-workspaces"].asBool()) {
+    const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (his != nullptr) {
+      hyprland::IPC::inst().registerForIPC("movewindow", this);
+      hyprland::IPC::inst().registerForIPC("openwindow", this);
+      hyprland::IPC::inst().registerForIPC("closewindow", this);
+      hyprland::IPC::inst().registerForIPC("configreloaded", this);
+      registered_for_hyprland_events_ = true;
+      spdlog::debug("Taskbar registered for Hyprland IPC events");
+    }
+  }
+#else
+  if (config_["sort-by-hyprland-workspaces"].asBool()) {
+    spdlog::warn(
+        "wlr/taskbar: sort-by-hyprland-workspaces needs a Waybar built with Hyprland support, "
+        "ignoring it");
+  }
+#endif  // HAVE_HYPRLAND
+
+  // Control socket for keyboard navigation; see man waybar-wlr-taskbar.
+  setupControlSocket();
+
+  /* Task icons are rasterized once, when the toplevel appears. Nothing else
+   * re-reads the theme afterwards, so switching icon theme at runtime leaves
+   * every existing task showing an icon from the previous one. A configured
+   * icon-theme is its own Gtk::IconTheme, so those need listening to as well. */
+  Gtk::IconTheme::get_default()->signal_changed().connect(
+      sigc::mem_fun(*this, &Taskbar::notify_icon_theme_changed));
+  for (const auto& [custom_theme_name, custom_theme] : icon_loader_.custom_themes()) {
+    custom_theme->signal_changed().connect(
+        sigc::mem_fun(*this, &Taskbar::notify_icon_theme_changed));
+  }
+
+  // Reload icons when the taskbar container is re-realized. This fires when
+  // Waybar's own layer-shell surface is destroyed and recreated (e.g. when a
+  // fullscreen screencopy tool like Satty briefly unmaps the bar layer). Cairo
+  // surfaces created with image.get_window() become stale for the new window.
+  box_.signal_realize().connect([this]() {
+    spdlog::debug("Taskbar: box_ realized, reloading all task icons");
+    for (auto& t : tasks_) {
+      t->reload_icon();
+    }
+    dp.emit();
+  });
 }
 
 Taskbar::~Taskbar() {
+  cleanupControlSocket();
+#ifdef HAVE_HYPRLAND
+  if (registered_for_hyprland_events_) {
+    hyprland::IPC::inst().unregisterForIPC(this);
+  }
+#endif
+
   if (workspace_manager_) {
     struct wl_display* display = Client::inst()->wl_display;
     ext_workspace_manager_v1_stop(workspace_manager_);
@@ -853,8 +1397,23 @@ Taskbar::~Taskbar() {
   }
 }
 
+void Taskbar::notify_icon_theme_changed() {
+  spdlog::debug("Taskbar: icon theme changed, queueing a reload of every task icon");
+  icon_theme_dirty_ = true;
+  if (!update_queued_) {
+    update_queued_ = true;
+    dp.emit();
+  }
+}
+
 void Taskbar::update() {
   update_queued_ = false;
+  if (std::exchange(icon_theme_dirty_, false)) {
+    spdlog::debug("Taskbar: reloading all task icons (deferred from theme change)");
+    for (auto& t : tasks_) {
+      t->reload_icon();
+    }
+  }
   for (auto& t : tasks_) {
     t->update();
   }
@@ -870,7 +1429,340 @@ void Taskbar::update() {
     }
   }
 
+#ifdef HAVE_HYPRLAND
+  if (config_["sort-by-hyprland-workspaces"].asBool()) {
+    // Check if Hyprland is running
+    const char* his = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (his != nullptr) {
+      try {
+        Json::Value clients = hyprland::IPC::inst().getSocket1JsonReply("clients");
+        if (clients.isArray()) {
+          // Build a list of all clients with their sort keys
+          // Using a vector to handle multiple windows with same class/title
+          struct ClientInfo {
+            std::string cls;
+            std::string title;
+            int workspace_id;
+            int x;
+            int y;
+          };
+          std::vector<ClientInfo> allClients;
+          for (Json::ArrayIndex i = 0; i < clients.size(); ++i) {
+            const auto& client = clients[i];
+            ClientInfo info;
+            info.cls = client["class"].asString();
+            info.title = client["title"].asString();
+            info.workspace_id = client["workspace"]["id"].asInt();
+            info.x = client["at"][0].asInt();
+            info.y = client["at"][1].asInt();
+            allClients.push_back(info);
+          }
+
+          // Sort clients by workspace, then x, then y
+          std::sort(allClients.begin(), allClients.end(),
+                    [](const ClientInfo& a, const ClientInfo& b) {
+                      if (a.workspace_id != b.workspace_id) return a.workspace_id < b.workspace_id;
+                      if (a.x != b.x) return a.x < b.x;
+                      return a.y < b.y;
+                    });
+
+          // Build a map from (class, title) to list of sort indices (for windows with same
+          // class/title)
+          std::map<std::pair<std::string, std::string>, std::vector<int>> clientIndices;
+          for (size_t i = 0; i < allClients.size(); ++i) {
+            auto key = std::make_pair(allClients[i].cls, allClients[i].title);
+            clientIndices[key].push_back(static_cast<int>(i));
+          }
+
+          // Track how many times we've seen each (class, title) pair during sorting
+          std::map<std::pair<std::string, std::string>, size_t> usedCount;
+
+          // Assign a sort index to each task
+          std::vector<int> taskSortIndex(tasks_.size(), INT_MAX);
+          for (size_t t = 0; t < tasks_.size(); ++t) {
+            auto key = std::make_pair(tasks_[t]->app_id(), tasks_[t]->title());
+            auto it = clientIndices.find(key);
+            if (it != clientIndices.end()) {
+              size_t& used = usedCount[key];
+              if (used < it->second.size()) {
+                taskSortIndex[t] = it->second[used];
+                ++used;
+              }
+            }
+          }
+
+          // Sort tasks by their assigned sort index
+          std::vector<size_t> taskOrder(tasks_.size());
+          std::iota(taskOrder.begin(), taskOrder.end(), 0);
+          std::stable_sort(
+              taskOrder.begin(), taskOrder.end(),
+              [&taskSortIndex](size_t a, size_t b) { return taskSortIndex[a] < taskSortIndex[b]; });
+
+          // Reorder tasks_ according to taskOrder
+          std::vector<TaskPtr> sortedTasks;
+          sortedTasks.reserve(tasks_.size());
+          for (size_t idx : taskOrder) {
+            sortedTasks.push_back(std::move(tasks_[idx]));
+          }
+          tasks_ = std::move(sortedTasks);
+
+          for (unsigned long i = 0; i < tasks_.size(); i++) {
+            move_button(tasks_[i]->button, i);
+          }
+        }
+      } catch (const std::exception& e) {
+        spdlog::warn("Failed to query Hyprland clients for taskbar sorting: {}", e.what());
+      }
+    }
+  }
+#endif  // HAVE_HYPRLAND
+
   AModule::update();
+}
+
+#ifdef HAVE_HYPRLAND
+void Taskbar::onEvent(const std::string& ev) {
+  // Hyprland window event received - trigger update to re-sort
+  spdlog::debug("Taskbar received Hyprland event: {}", ev);
+  dp.emit();
+}
+#endif
+
+void Taskbar::setupControlSocket() {
+  const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
+  std::string display_name = wayland_display ? wayland_display : "wayland-0";
+
+  // $XDG_RUNTIME_DIR is per-user and already 0700, so a socket there is not
+  // reachable by other users at all. /tmp is world-writable and was the old
+  // location: anything running as any user could connect and activate windows.
+  // The uid in the fallback name keeps two users from colliding on a machine
+  // where XDG_RUNTIME_DIR somehow is not set; the peer check in socketListener()
+  // is what actually enforces the boundary in either case.
+  const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
+  if (runtime_dir != nullptr && *runtime_dir != '\0') {
+    socket_path_ = fmt::format("{}/waybar-taskbar-{}.sock", runtime_dir, display_name);
+  } else {
+    socket_path_ = fmt::format("/tmp/waybar-taskbar-{}-{}.sock", getuid(), display_name);
+    spdlog::warn("XDG_RUNTIME_DIR is not set; taskbar control socket falls back to {}",
+                 socket_path_);
+  }
+
+  // Remove existing socket file if it exists
+  unlink(socket_path_.c_str());
+
+  socket_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (socket_fd_ < 0) {
+    spdlog::error("Failed to create taskbar control socket: {}", strerror(errno));
+    return;
+  }
+
+  // Create the socket with 0600 rather than whatever the umask happens to be.
+  // Set before bind(), because the permissions of a unix socket are taken from
+  // the mode in effect at bind time; a later chmod races against connects.
+  mode_t old_umask = umask(0077);
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  if (socket_path_.size() >= sizeof(addr.sun_path)) {
+    spdlog::error("Taskbar control socket path is too long: {}", socket_path_);
+    umask(old_umask);
+    close(socket_fd_);
+    socket_fd_ = -1;
+    return;
+  }
+  strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+
+  if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    umask(old_umask);
+    spdlog::error("Failed to bind taskbar control socket: {}", strerror(errno));
+    close(socket_fd_);
+    socket_fd_ = -1;
+    return;
+  }
+
+  if (listen(socket_fd_, 5) < 0) {
+    umask(old_umask);
+    spdlog::error("Failed to listen on taskbar control socket: {}", strerror(errno));
+    close(socket_fd_);
+    socket_fd_ = -1;
+    return;
+  }
+
+  umask(old_umask);
+
+  socket_running_ = true;
+  socket_thread_ = std::thread(&Taskbar::socketListener, this);
+  spdlog::info("Taskbar control socket listening at {}", socket_path_);
+}
+
+void Taskbar::cleanupControlSocket() {
+  socket_running_ = false;
+  if (socket_fd_ >= 0) {
+    shutdown(socket_fd_, SHUT_RDWR);
+    close(socket_fd_);
+    socket_fd_ = -1;
+  }
+  if (socket_thread_.joinable()) {
+    socket_thread_.join();
+  }
+  if (!socket_path_.empty()) {
+    unlink(socket_path_.c_str());
+  }
+}
+
+void Taskbar::socketListener() {
+  while (socket_running_) {
+    struct pollfd pfd;
+    pfd.fd = socket_fd_;
+    pfd.events = POLLIN;
+
+    int ret = poll(&pfd, 1, 100);  // 100ms timeout
+    if (ret <= 0) continue;
+
+    int client_fd = accept(socket_fd_, nullptr, nullptr);
+    if (client_fd < 0) {
+      if (socket_running_) {
+        spdlog::error("Error accepting connection: {}", strerror(errno));
+      }
+      continue;
+    }
+
+    // These commands focus and raise windows, so only this user may issue them.
+    // The socket lives under $XDG_RUNTIME_DIR and is 0600, but that is a
+    // property of the path; this is the check that holds even if the socket ends
+    // up somewhere more permissive. SO_PEERCRED is the kernel's own view of who
+    // connected and cannot be spoofed by the peer.
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0) {
+      spdlog::warn("Rejecting taskbar control connection: no peer credentials ({})",
+                   strerror(errno));
+      close(client_fd);
+      continue;
+    }
+    if (cred.uid != getuid()) {
+      spdlog::warn("Rejecting taskbar control connection from uid {} (pid {})", cred.uid, cred.pid);
+      close(client_fd);
+      continue;
+    }
+
+    char buffer[256];
+    ssize_t n = read(client_fd, buffer, sizeof(buffer) - 1);
+    close(client_fd);
+
+    if (n > 0) {
+      buffer[n] = '\0';
+      std::string line(buffer);
+
+      // Trim whitespace
+      line.erase(0, line.find_first_not_of(" \t\r\n"));
+      auto pos = line.find_last_not_of(" \t\r\n");
+      if (pos != std::string::npos) {
+        line.erase(pos + 1);
+      }
+
+      if (!line.empty()) {
+        spdlog::debug("Taskbar received command: {}", line);
+        // Dispatch to main thread
+        Glib::signal_idle().connect_once([this, line]() { handleCommand(line); });
+      }
+    }
+  }
+}
+
+void Taskbar::handleCommand(const std::string& cmd) {
+  if (cmd == "next") {
+    selectNext();
+  } else if (cmd == "prev") {
+    selectPrev();
+  } else if (cmd == "activate") {
+    activateSelected();
+  } else if (cmd == "clear" || cmd == "cancel") {
+    clearSelection();
+  } else if (cmd == "refresh") {
+    dp.emit();
+  } else {
+    spdlog::warn("Unknown taskbar command: {}", cmd);
+  }
+}
+
+void Taskbar::selectNext() {
+  if (tasks_.empty()) return;
+
+  int old_index = selection_index_;
+  if (selection_index_ < 0) {
+    // Start from the previously active window (MRU order)
+    selection_index_ = 0;  // fallback to first
+    spdlog::info("Taskbar::selectNext: looking for previous_active_id_={}, current_active_id_={}",
+                 previous_active_id_, current_active_id_);
+    for (size_t i = 0; i < tasks_.size(); ++i) {
+      spdlog::info("  Task[{}]: id={}, title={}, active={}", i, tasks_[i]->id(), tasks_[i]->title(),
+                   tasks_[i]->active());
+      if (tasks_[i]->id() == previous_active_id_) {
+        selection_index_ = static_cast<int>(i);
+        break;
+      }
+    }
+    spdlog::info("Taskbar::selectNext: selected index {}", selection_index_);
+  } else {
+    selection_index_ = (selection_index_ + 1) % static_cast<int>(tasks_.size());
+  }
+  updateSelection(old_index);
+}
+
+void Taskbar::selectPrev() {
+  if (tasks_.empty()) return;
+
+  int old_index = selection_index_;
+  if (selection_index_ < 0) {
+    // Start from the previously active window (MRU order)
+    selection_index_ = static_cast<int>(tasks_.size()) - 1;  // fallback to last
+    for (size_t i = 0; i < tasks_.size(); ++i) {
+      if (tasks_[i]->id() == previous_active_id_) {
+        selection_index_ = static_cast<int>(i);
+        break;
+      }
+    }
+  } else {
+    selection_index_ =
+        (selection_index_ - 1 + static_cast<int>(tasks_.size())) % static_cast<int>(tasks_.size());
+  }
+  updateSelection(old_index);
+}
+
+void Taskbar::activateSelected() {
+  if (selection_index_ >= 0 && selection_index_ < static_cast<int>(tasks_.size())) {
+    tasks_[selection_index_]->activate();
+  }
+  clearSelection();
+}
+
+void Taskbar::clearSelection() {
+  int old_index = selection_index_;
+  selection_index_ = -1;
+  updateSelection(old_index);
+}
+
+void Taskbar::updateSelection(int old_index) {
+  // Remove class from old selection
+  if (old_index >= 0 && old_index < static_cast<int>(tasks_.size())) {
+    tasks_[old_index]->button.get_style_context()->remove_class("keyboard-selected");
+  }
+  // Add class to new selection
+  if (selection_index_ >= 0 && selection_index_ < static_cast<int>(tasks_.size())) {
+    tasks_[selection_index_]->button.get_style_context()->add_class("keyboard-selected");
+  }
+}
+
+void Taskbar::notifyActiveChanged(uint32_t new_active_id) {
+  // Save the current active as previous, then update current
+  if (current_active_id_ != 0 && current_active_id_ != new_active_id) {
+    spdlog::info("Taskbar: previous_active changing from {} to {}, new current: {}",
+                 previous_active_id_, current_active_id_, new_active_id);
+    previous_active_id_ = current_active_id_;
+  }
+  current_active_id_ = new_active_id;
 }
 
 static void tm_handle_toplevel(void* data, struct zwlr_foreign_toplevel_manager_v1* manager,
@@ -1125,6 +2017,16 @@ void Taskbar::remove_button(Gtk::Button& bt) {
 }
 
 void Taskbar::remove_task(uint32_t id) {
+  // Clear stale IDs if the removed task was tracked
+  if (previous_active_id_ == id) {
+    spdlog::info("Taskbar: clearing previous_active_id_ {} (task closed)", id);
+    previous_active_id_ = 0;
+  }
+  if (current_active_id_ == id) {
+    spdlog::info("Taskbar: clearing current_active_id_ {} (task closed)", id);
+    current_active_id_ = 0;
+  }
+
   auto it = std::find_if(std::begin(tasks_), std::end(tasks_),
                          [id](const TaskPtr& p) { return p->id() == id; });
 
@@ -1202,6 +2104,10 @@ const std::unordered_set<std::string>& Taskbar::squash_list() const { return squ
 
 const std::map<std::string, std::string>& Taskbar::app_ids_replace_map() const {
   return app_ids_replace_map_;
+}
+
+const std::map<std::string, std::string>& Taskbar::fg_process_map() const {
+  return fg_process_map_;
 }
 
 } /* namespace waybar::modules::wlr */
