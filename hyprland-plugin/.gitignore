@@ -1,0 +1,14 @@
+# Build artifacts
+*.so
+*.o
+*.obj
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Build directories
+build/
