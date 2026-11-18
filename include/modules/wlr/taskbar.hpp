@@ -85,6 +85,11 @@ class Task {
   bool title_lookup_pending_ = false;
   /* The app_id or title that app_info_ was last looked up from */
   std::string lookup_source_;
+  /* The entry this task's own app_id/title resolved to, and whether app_info_
+   * currently holds a terminal's foreground program instead. A terminal keeps
+   * its own entry here so the icon can go back to it when that program exits. */
+  Glib::RefPtr<Gio::DesktopAppInfo> own_app_info_;
+  bool fg_icon_applied_ = false;
 
   bool with_icon_ = false;
   bool with_name_ = false;

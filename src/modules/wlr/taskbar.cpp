@@ -590,12 +590,30 @@ void Task::lookup_app_info() {
     }
   }
 
+  // The entry the task's own app_id/title resolved to, kept so the terminal
+  // branch below can put it back once the foreground program is gone.
+  if (looked_up) {
+    own_app_info_ = app_info_;
+  }
+
   // Runs once per batch of events like the lookups above, rather than inside
   // the Wayland handlers: this costs a Hyprland IPC round trip and a walk of
   // /proc, and a terminal rewriting its title on every prompt would otherwise
   // starve the main loop -- the same failure the lookup batching fixed.
-  if (recheck_terminal_fg && isKnownTerminal(app_id_) && tryUpdateIconFromTerminalFg()) {
-    return;  // the helper set icon_, app_info_ and name_ itself
+  if (recheck_terminal_fg && isKnownTerminal(app_id_)) {
+    if (tryUpdateIconFromTerminalFg()) {
+      fg_icon_applied_ = true;
+      return;  // the helper set icon_, app_info_ and name_ itself
+    }
+    // Nothing in the foreground any more -- the program exited and the shell is
+    // back, or it has no icon of its own. Restore the terminal's own entry, or
+    // the program's icon stays on the button for as long as the terminal lives.
+    if (fg_icon_applied_) {
+      fg_icon_applied_ = false;
+      app_info_ = own_app_info_;
+      name_ = app_info_ ? app_info_->get_display_name() : app_id_;
+      looked_up = true;  // the icon below is the foreground program's, reload it
+    }
   }
 
   if (!looked_up || !with_icon_) {
